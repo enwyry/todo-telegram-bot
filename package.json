@@ -10,7 +10,8 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env src/bot.ts",
     "dev": "node --watch --env-file-if-exists=.env src/bot.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node test/flows.mjs"
   },
   "dependencies": {
     "grammy": "^1.45.1"
