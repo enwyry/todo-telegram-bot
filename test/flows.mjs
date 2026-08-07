@@ -20,7 +20,7 @@ process.env.BOT_TOKEN ??= "111111:TEST-TOKEN-NOT-USED-NETWORK-IS-STUBBED";
 
 const { bot, deliverDueReminders } = await import("../src/bot.ts");
 const db = await import("../src/db.ts");
-const { ymd, parseTime, formatDeadline } = await import("../src/pickers.ts");
+const { ymd, parseTime, formatDeadline, shiftMinutes } = await import("../src/pickers.ts");
 
 const USER = 424242;
 const CHAT = 424242;
@@ -128,6 +128,8 @@ async function tap(data) {
 }
 
 const pass = (name) => console.log(`  ✓ ${name}`);
+/** Reminders the user set by hand — the automatic ones are asserted separately. */
+const manual = (user = USER) => db.listReminders(user).filter((r) => !r.auto);
 const futureDate = () => {
   const d = new Date();
   d.setDate(d.getDate() + 3);
@@ -266,7 +268,7 @@ await tap(`day:r:${taskId}:${date}`);
 
 await tap(`min:r:${taskId}:${date}:09:00`);
 {
-  const rs = db.listReminders(USER);
+  const rs = manual();
   assert.equal(rs.length, 1, "reminder not stored");
   assert.equal(rs[0].remind_at, `${date} 09:00`);
   assert.match(last("editMessageText").payload.text, /remind you/i);
@@ -285,26 +287,26 @@ await tap(`min:r:${taskId}:2020-01-01:09:00`);
   // A day long gone gets the "start again" wording; an earlier time *today*
   // gets "pick a later one", since that one is still worth retrying.
   assert.match(answer.text, /behind us/i, "past reminder should be refused");
-  assert.equal(db.listReminders(USER).length, 1, "past reminder must not be stored");
+  assert.equal(manual().length, 1, "past reminder must not be stored");
   pass("refuses a reminder in the past");
 }
 
 {
   // Earlier today: still refused, but retryable, so it asks for another time.
-  const before = db.listReminders(USER).length;
+  const before = manual().length;
   await tap(`min:r:${taskId}:${ymd(new Date())}:00:00`);
   assert.match(last("answerCallbackQuery").payload.text, /passed/i);
-  assert.equal(db.listReminders(USER).length, before, "past time today was stored");
+  assert.equal(manual().length, before, "past time today was stored");
   pass("an earlier time today asks for a later one");
 }
 
 {
   // Same guard, but reached by typing rather than tapping a minute button.
-  const before = db.listReminders(USER).length;
+  const before = manual().length;
   await tap(`type:r:${taskId}:2020-01-01`);
   await send("09:00");
   assert.match(last("sendMessage").payload.text, /behind us/i);
-  assert.equal(db.listReminders(USER).length, before, "typed past reminder was stored");
+  assert.equal(manual().length, before, "typed past reminder was stored");
   pass("refuses a typed reminder in the past");
 }
 
@@ -358,12 +360,15 @@ console.log("\nreminder bounded by the deadline");
   await tap(`type:r:${taskId}:${date}`);
   await send("23:59");
   assert.match(last("sendMessage").payload.text, /after the deadline/i);
-  assert.equal(db.listReminders(USER).length, 1, "over-deadline reminder was stored");
+  assert.equal(manual().length, 1, "over-deadline reminder was stored");
   pass("typed time past the deadline is refused");
 }
 
 console.log("\n/remove — task or reminder");
 {
+  // This block counts rows in the remove UI, so drop the two the deadline added
+  // on its own — they get their own coverage under "default reminders" below.
+  db.clearAutoReminders(USER, taskId);
   db.addReminder(USER, taskId, `${date} 10:00`); // now two pending
   await send("/remove");
   const opts = buttons();
@@ -386,7 +391,7 @@ let reminderId;
 
 await tap(`rmr:${reminderId}`);
 {
-  assert.equal(db.listReminders(USER).length, 1, "reminder not dropped");
+  assert.equal(manual().length, 1, "reminder not dropped");
   assert.ok(db.getTask(USER, taskId), "dropping a reminder must not delete the task");
   pass("drops the reminder, keeps the task");
 }
@@ -408,7 +413,7 @@ await tap(`rm:${taskId}`);
 await tap("rmno");
 {
   assert.ok(db.getTask(USER, taskId), "declining must keep the task");
-  assert.equal(db.listReminders(USER).length, 1, "declining must keep the reminders");
+  assert.equal(manual().length, 1, "declining must keep the reminders");
   pass("'Keep it' cancels the deletion");
 }
 
@@ -912,6 +917,132 @@ console.log("\n[fix2] a refused typed time still listens for the correction");
   assert.equal(db.taskReminders(USER, t3.id).length, 0);
   pass("an unsatisfiable day stands down instead of looping");
   db.removeTask(USER, t3.id);
+}
+
+console.log("\ndefault reminders: 1 hour and 30 minutes before");
+{
+  for (const t of db.listTasks(USER)) db.removeTask(USER, t.id);
+
+  await send("/add dentist");
+  const id = Number(buttons().find((b) => b.data?.startsWith("day:d:")).data.split(":")[2]);
+  const d = futureDate();
+  await tap(`min:d:${id}:${d}:14:00`);
+
+  const at = db.taskReminders(USER, id).map((r) => r.remind_at);
+  assert.deepEqual(at, [`${d} 13:00`, `${d} 13:30`], `got ${JSON.stringify(at)}`);
+  assert.match(last("editMessageText").payload.text, /13:00 and 13:30/,
+    "the confirmation should say when the nudges are");
+  pass("a timed deadline gets both defaults");
+
+  // Re-picking the deadline moves them rather than piling up.
+  await tap(`min:d:${id}:${d}:18:00`);
+  const moved = db.taskReminders(USER, id).map((r) => r.remind_at);
+  assert.deepEqual(moved, [`${d} 17:00`, `${d} 17:30`], `got ${JSON.stringify(moved)}`);
+  pass("re-picking the deadline moves them, it doesn't duplicate them");
+
+  // A reminder the user set by hand must survive that.
+  db.addReminder(USER, id, `${d} 08:00`);
+  await tap(`min:d:${id}:${d}:20:00`);
+  const kept = db.taskReminders(USER, id).map((r) => r.remind_at);
+  assert.ok(kept.includes(`${d} 08:00`), "a hand-made reminder was swept away");
+  assert.deepEqual(kept, [`${d} 08:00`, `${d} 19:00`, `${d} 19:30`]);
+  pass("hand-made reminders are left alone");
+
+  // All-day has no time to count back from, and clears any leftovers.
+  await tap(`allday:${id}:${d}`);
+  const afterAllDay = db.taskReminders(USER, id).map((r) => r.remind_at);
+  assert.deepEqual(afterAllDay, [`${d} 08:00`], "all-day should keep only the manual one");
+  pass("an all-day deadline gets no defaults and drops the old ones");
+  db.removeTask(USER, id);
+}
+
+console.log("\ndefault reminders: a hand-made one at the same minute wins");
+{
+  await send("/add review PR");
+  const id = Number(buttons().find((b) => b.data?.startsWith("day:d:")).data.split(":")[2]);
+  const d = futureDate();
+  db.addReminder(USER, id, `${d} 09:00`); // exactly where the 1-hour one will land
+
+  await tap(`min:d:${id}:${d}:10:00`);
+  const rs = db.taskReminders(USER, id);
+  assert.deepEqual(rs.map((r) => r.remind_at), [`${d} 09:00`, `${d} 09:30`]);
+  assert.equal(rs[0].auto, 0, "the hand-made reminder was taken over as automatic");
+  assert.equal(rs[1].auto, 1);
+
+  // It must not claim credit for a reminder that was already there.
+  const text = last("editMessageText").payload.text;
+  assert.match(text, /09:30/);
+  assert.ok(!/09:00/.test(text), `claimed a nudge the user had already set: ${text}`);
+  pass("the existing reminder is left as the user's, and not double-counted");
+
+  // ...and because it stayed hand-made, moving the deadline doesn't sweep it up.
+  await tap(`min:d:${id}:${d}:16:00`);
+  const after = db.taskReminders(USER, id).map((r) => `${r.remind_at}${r.auto ? "*" : ""}`);
+  assert.deepEqual(after, [`${d} 09:00`, `${d} 15:00*`, `${d} 15:30*`]);
+  pass("and it survives the next deadline change");
+  db.removeTask(USER, id);
+}
+
+console.log("\ndefault reminders: nothing in the past");
+{
+  await send("/add imminent");
+  const id = Number(buttons().find((b) => b.data?.startsWith("day:d:")).data.split(":")[2]);
+
+  // Due in ~10 minutes: both offsets land in the past, so neither is set.
+  const soon = new Date();
+  soon.setMinutes(soon.getMinutes() + 10);
+  const iso = ymd(soon);
+  const hhmm = `${String(soon.getHours()).padStart(2, "0")}:${String(soon.getMinutes()).padStart(2, "0")}`;
+  await tap(`min:d:${id}:${iso}:${hhmm.slice(0, 2)}:${hhmm.slice(3)}`);
+
+  assert.equal(db.taskReminders(USER, id).length, 0,
+    "a reminder was set in the past — it would fire instantly");
+  assert.ok(!/Nudges set/.test(last("editMessageText").payload.text),
+    "shouldn't claim nudges it didn't set");
+  pass("a task due in 10 minutes gets neither default");
+
+  // Due in ~45 minutes: the 30-minute one still fits, the 1-hour one doesn't.
+  const later = new Date();
+  later.setMinutes(later.getMinutes() + 45);
+  const iso2 = ymd(later);
+  const h2 = String(later.getHours()).padStart(2, "0");
+  const m2 = String(later.getMinutes()).padStart(2, "0");
+  await tap(`min:d:${id}:${iso2}:${h2}:${m2}`);
+
+  const some = db.taskReminders(USER, id);
+  assert.equal(some.length, 1, `expected just the 30-minute nudge, got ${some.length}`);
+  assert.equal(some[0].remind_at, shiftMinutes(`${iso2} ${h2}:${m2}`, -30));
+  pass("a task due in 45 minutes gets only the 30-minute one");
+  db.removeTask(USER, id);
+}
+
+console.log("\ndefault reminders: they behave like any other reminder");
+{
+  await send("/add board meeting");
+  const id = Number(buttons().find((b) => b.data?.startsWith("day:d:")).data.split(":")[2]);
+  const d = futureDate();
+  await tap(`min:d:${id}:${d}:09:00`);
+
+  await send("/list");
+  const listed = last("sendMessage").payload.text;
+  assert.match(listed, /08:00/, "defaults should show under the task in /list");
+  assert.match(listed, /08:30/);
+  pass("they appear in /list");
+
+  await send("/remove");
+  await tap("rmenu:r");
+  const rows = buttons().filter((b) => b.data?.startsWith("rmr:"));
+  assert.equal(rows.length, 2, "defaults should be droppable individually");
+  await tap(rows[0].data);
+  assert.equal(db.taskReminders(USER, id).length, 1, "dropping one should leave the other");
+  pass("they can be dropped one at a time");
+
+  // Deleting the task still warns about them and takes them with it.
+  await tap(`rm:${id}`);
+  assert.match(last("editMessageText").payload.text, /1 reminder/);
+  await tap(`rmyes:${id}`);
+  assert.equal(db.taskReminders(USER, id).length, 0);
+  pass("deleting the task still warns, then cascades");
 }
 
 console.log("\n[fix2] the startup migration collapses pre-existing duplicates");

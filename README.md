@@ -11,6 +11,10 @@ Every user gets their own private list.
 | `/reminder` | Pick a task, pick a date and time — the bot messages you when it's due  |
 | `/remove`   | Delete a task, or just one of its reminders                             |
 
+Give a task a **time** and it gets two reminders automatically — **1 hour** and
+**30 minutes** beforehand. They behave like any other reminder: they show in
+`/list`, and `/remove` can drop either one on its own.
+
 Pick dates and times **from buttons** — a month calendar, then an hour, then any
 of the 60 minutes. Or tap **⌨️ Type a time** and write `14:37` / `2:30pm` if
 that's quicker.
@@ -127,6 +131,14 @@ long after SIGTERM. If the grace runs out the handle is simply left open: every
 write is already committed and WAL recovers on the next start, whereas closing
 early would finalize the statements mid-send and leave a reminder Telegram had
 already delivered marked unsent — so it would arrive twice.
+
+**The default reminders follow the deadline.** They're marked in the database as
+automatic, so re-picking a deadline moves them instead of leaving the old pair
+behind — while any reminder you set by hand is left exactly where you put it,
+including one that happens to fall on the same minute as a default. Offsets that
+would land in the past are skipped, so a task due in ten minutes gets neither
+rather than a reminder that fires the instant it's saved. An all-day task has no
+time to count back from, so it gets none.
 
 **The same reminder can't be set twice.** Several reminders on one task are the
 point, but two at the same minute could only ever produce two identical

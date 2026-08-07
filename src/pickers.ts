@@ -111,6 +111,23 @@ export function nextMinute(): string {
   return `${ymd(d)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+/**
+ * "YYYY-MM-DD HH:MM" shifted by some minutes, as local wall time.
+ *
+ * Going through a Date means hour, day, month and year rollover are handled,
+ * and so is a DST boundary: an hour before 03:30 on a spring-forward morning is
+ * 01:30, not the 02:30 that never existed.
+ */
+export function shiftMinutes(when: string, delta: number): string {
+  const [datePart, timePart] = when.split(" ");
+  const [year, month, day] = (datePart ?? "").split("-").map(Number);
+  const [hour, minute] = (timePart ?? "00:00").split(":").map(Number);
+
+  const d = new Date(year ?? 0, (month ?? 1) - 1, day ?? 1, hour ?? 0, minute ?? 0);
+  d.setMinutes(d.getMinutes() + delta);
+  return `${ymd(d)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 function startOfToday(): Date {
   const now = new Date();
   return new Date(now.getFullYear(), now.getMonth(), now.getDate());

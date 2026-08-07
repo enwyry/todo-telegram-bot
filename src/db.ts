@@ -40,6 +40,15 @@ if (!columns.some((c) => c.name === "deadline")) {
   db.exec(`ALTER TABLE tasks ADD COLUMN deadline TEXT`);
 }
 
+// Reminders added automatically from a deadline are marked, so that re-picking
+// that deadline can replace them without disturbing any the user set by hand.
+const reminderColumns = db.prepare(`PRAGMA table_info(reminders)`).all() as unknown as {
+  name: string;
+}[];
+if (!reminderColumns.some((c) => c.name === "auto")) {
+  db.exec(`ALTER TABLE reminders ADD COLUMN auto INTEGER NOT NULL DEFAULT 0`);
+}
+
 // Two reminders on the same task at the same minute can only ever produce two
 // identical messages, so they're collapsed to one. Older databases may already
 // hold such pairs, and the unique index below cannot be created until they're
@@ -109,6 +118,8 @@ export type Reminder = {
   task_id: number;
   remind_at: string;
   sent_at: string | null;
+  /** 1 when it was derived from the task's deadline rather than chosen by hand. */
+  auto: number;
   /** Text of the task this reminder belongs to, for labelling buttons. */
   text: string;
 };
@@ -117,27 +128,31 @@ export type Reminder = {
 export type DueReminder = Reminder & { user_id: number; text: string };
 
 const insertReminder = db.prepare(
-  `INSERT INTO reminders (task_id, user_id, remind_at)
-   SELECT ?, user_id, ? FROM tasks WHERE id = ? AND user_id = ?
-   RETURNING id, task_id, remind_at, sent_at, '' AS text`,
+  `INSERT INTO reminders (task_id, user_id, remind_at, auto)
+   SELECT ?, user_id, ?, ? FROM tasks WHERE id = ? AND user_id = ?
+   RETURNING id, task_id, remind_at, sent_at, auto, '' AS text`,
+);
+const deleteAutoReminders = db.prepare(
+  `DELETE FROM reminders
+   WHERE user_id = ? AND task_id = ? AND auto = 1 AND sent_at IS NULL`,
 );
 const selectReminders = db.prepare(
-  `SELECT r.id, r.task_id, r.remind_at, r.sent_at, t.text
+  `SELECT r.id, r.task_id, r.remind_at, r.sent_at, r.auto, t.text
    FROM reminders r JOIN tasks t ON t.id = r.task_id
    WHERE r.user_id = ? AND r.sent_at IS NULL ORDER BY r.remind_at`,
 );
 const selectTaskReminders = db.prepare(
-  `SELECT r.id, r.task_id, r.remind_at, r.sent_at, t.text
+  `SELECT r.id, r.task_id, r.remind_at, r.sent_at, r.auto, t.text
    FROM reminders r JOIN tasks t ON t.id = r.task_id
    WHERE r.user_id = ? AND r.task_id = ? AND r.sent_at IS NULL
    ORDER BY r.remind_at`,
 );
 const deleteReminder = db.prepare(
   `DELETE FROM reminders WHERE user_id = ? AND id = ?
-   RETURNING id, task_id, remind_at, sent_at, '' AS text`,
+   RETURNING id, task_id, remind_at, sent_at, auto, '' AS text`,
 );
 const selectDue = db.prepare(
-  `SELECT r.id, r.task_id, r.remind_at, r.sent_at, r.user_id, t.text
+  `SELECT r.id, r.task_id, r.remind_at, r.sent_at, r.auto, r.user_id, t.text
    FROM reminders r JOIN tasks t ON t.id = r.task_id
    WHERE r.sent_at IS NULL AND r.remind_at <= ?
    ORDER BY r.remind_at`,
@@ -146,7 +161,7 @@ const markReminderSent = db.prepare(
   `UPDATE reminders SET sent_at = ? WHERE id = ?`,
 );
 const selectPendingAt = db.prepare(
-  `SELECT r.id, r.task_id, r.remind_at, r.sent_at, t.text
+  `SELECT r.id, r.task_id, r.remind_at, r.sent_at, r.auto, t.text
    FROM reminders r JOIN tasks t ON t.id = r.task_id
    WHERE r.user_id = ? AND r.task_id = ? AND r.remind_at = ? AND r.sent_at IS NULL`,
 );
@@ -166,10 +181,11 @@ export function addReminder(
   userId: number,
   taskId: number,
   remindAt: string,
+  auto = false,
 ): Reminder | null {
   try {
     return (
-      (insertReminder.get(taskId, remindAt, taskId, userId) as
+      (insertReminder.get(taskId, remindAt, auto ? 1 : 0, taskId, userId) as
         | Reminder
         | undefined) ?? null
     );
@@ -177,6 +193,14 @@ export function addReminder(
     if (!isUniqueViolation(err)) throw err;
     return pendingReminderAt(userId, taskId, remindAt);
   }
+}
+
+/**
+ * Drops a task's automatic reminders, leaving hand-made ones alone. Used when a
+ * deadline is re-picked, so the defaults follow it instead of piling up.
+ */
+export function clearAutoReminders(userId: number, taskId: number): void {
+  deleteAutoReminders.run(userId, taskId);
 }
 
 function isUniqueViolation(err: unknown): boolean {

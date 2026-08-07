@@ -2,6 +2,7 @@ import { Bot, GrammyError, InlineKeyboard } from "grammy";
 import {
   addReminder,
   addTask,
+  clearAutoReminders,
   closeDb,
   dueReminders,
   getTask,
@@ -27,6 +28,7 @@ import {
   nextMinute,
   nowLocal,
   parseTime,
+  shiftMinutes,
   ymd,
   type Bounds,
   type Mode,
@@ -326,7 +328,10 @@ bot.command("start", async (ctx) => {
       "<b>/add</b> <i>task</i> — add a task, then pick its date &amp; time",
       "<b>/list</b> — see everything, soonest first",
       "<b>/reminder</b> — get pinged about a task",
-      "<b>/remove</b> — remove a task",
+      "<b>/remove</b> — remove a task, or one of its reminders",
+      "",
+      "Give a task a time and I'll nudge you <b>1 hour</b> and <b>30 minutes</b> "
+        + "beforehand, automatically. Drop either with <b>/remove</b>.",
       "",
       "That's it. Try <code>/add buy milk</code>.",
     ].join("\n"),
@@ -721,6 +726,10 @@ async function finishDeadline(
   const task = setDeadline(ctx.from.id, taskId, deadline);
   if (!task) return expired(ctx);
 
+  // No time to count back from, so no defaults — and any left over from an
+  // earlier timed deadline are cleared rather than left pointing nowhere.
+  applyDefaultReminders(ctx.from.id, task);
+
   await ctx.answerCallbackQuery(deadline ? "Date set" : "Saved");
   await ctx.editMessageText(
     `✅ Added ${describe(task)}\n\n<i>Want a nudge? /reminder</i>`,
@@ -744,6 +753,50 @@ type Commit =
 
 const gone = { ok: false, text: "That task no longer exists.", retry: false } as const;
 
+/**
+ * Every task with a time gets these automatically, counted back from its
+ * deadline. Anything already in the past is skipped, so a task due in ten
+ * minutes gets neither rather than a reminder that fires instantly.
+ */
+const DEFAULT_REMINDER_OFFSETS = [60, 30];
+
+/**
+ * Puts the default reminders on a task whose deadline has just been set, and
+ * returns the ones that were actually added.
+ *
+ * Previous automatic reminders are cleared first so that re-picking a deadline
+ * moves them rather than leaving the old ones behind. Reminders the user added
+ * by hand are untouched — including one that happens to fall on the same minute
+ * as a default, which is left as theirs rather than being taken over.
+ */
+function applyDefaultReminders(userId: number, task: Task): Reminder[] {
+  clearAutoReminders(userId, task.id);
+
+  // An all-day task has no time to count back from.
+  if (!task.deadline?.includes(" ")) return [];
+
+  const floor = nowLocal();
+  const added: Reminder[] = [];
+
+  for (const offset of DEFAULT_REMINDER_OFFSETS) {
+    const when = shiftMinutes(task.deadline, -offset);
+    if (when <= floor) continue;
+    if (pendingReminderAt(userId, task.id, when)) continue;
+
+    const reminder = addReminder(userId, task.id, when, true);
+    if (reminder) added.push(reminder);
+  }
+
+  return added;
+}
+
+/** "🔔 I'll nudge you 1 hour and 30 minutes before." */
+function describeDefaults(added: Reminder[]): string {
+  if (added.length === 0) return "";
+  const times = added.map((r) => formatDeadline(r.remind_at).replace(/^.*, /, ""));
+  return `\n🔔 Nudges set for ${times.join(" and ")}.`;
+}
+
 function commitWhen(
   mode: Mode,
   userId: number,
@@ -753,9 +806,12 @@ function commitWhen(
   if (mode === "d") {
     const task = setDeadline(userId, taskId, when);
     if (!task) return gone;
+    const added = applyDefaultReminders(userId, task);
     return {
       ok: true,
-      text: `✅ Added ${describe(task)}\n\n<i>Want a nudge? /reminder</i>`,
+      text:
+        `✅ Added ${describe(task)}${describeDefaults(added)}\n\n` +
+        `<i>Want another? /reminder</i>`,
     };
   }
 
