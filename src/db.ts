@@ -40,6 +40,20 @@ if (!columns.some((c) => c.name === "deadline")) {
   db.exec(`ALTER TABLE tasks ADD COLUMN deadline TEXT`);
 }
 
+// Two reminders on the same task at the same minute can only ever produce two
+// identical messages, so they're collapsed to one. Older databases may already
+// hold such pairs, and the unique index below cannot be created until they're
+// gone — so the cleanup runs first. Sent reminders are left alone: they're
+// history, and constraining them would reject a legitimate repeat next year.
+db.exec(`
+  DELETE FROM reminders WHERE sent_at IS NULL AND id NOT IN (
+    SELECT MIN(id) FROM reminders WHERE sent_at IS NULL
+    GROUP BY task_id, remind_at
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS reminders_unique_pending
+    ON reminders (task_id, remind_at) WHERE sent_at IS NULL;
+`);
+
 const FIELDS = `id, text, created_at, deadline`;
 
 const insertTask = db.prepare(
@@ -131,17 +145,46 @@ const selectDue = db.prepare(
 const markReminderSent = db.prepare(
   `UPDATE reminders SET sent_at = ? WHERE id = ?`,
 );
+const selectPendingAt = db.prepare(
+  `SELECT r.id, r.task_id, r.remind_at, r.sent_at, t.text
+   FROM reminders r JOIN tasks t ON t.id = r.task_id
+   WHERE r.user_id = ? AND r.task_id = ? AND r.remind_at = ? AND r.sent_at IS NULL`,
+);
+const selectStillPending = db.prepare(
+  `SELECT 1 AS ok FROM reminders WHERE id = ? AND sent_at IS NULL`,
+);
 
-/** Returns null if the task isn't the user's — the INSERT..SELECT yields no row. */
+/**
+ * Returns null if the task isn't the user's — the INSERT..SELECT yields no row.
+ *
+ * If the unique index rejects the write, a pending reminder for that exact
+ * minute already exists, which is the outcome the caller wanted anyway: it is
+ * returned instead of throwing. Callers check `pendingReminderAt` first, so
+ * in-process this never fires; it covers a second bot process racing this one.
+ */
 export function addReminder(
   userId: number,
   taskId: number,
   remindAt: string,
 ): Reminder | null {
+  try {
+    return (
+      (insertReminder.get(taskId, remindAt, taskId, userId) as
+        | Reminder
+        | undefined) ?? null
+    );
+  } catch (err) {
+    if (!isUniqueViolation(err)) throw err;
+    return pendingReminderAt(userId, taskId, remindAt);
+  }
+}
+
+function isUniqueViolation(err: unknown): boolean {
+  // SQLITE_CONSTRAINT_UNIQUE. node:sqlite exposes it as `errcode`.
   return (
-    (insertReminder.get(taskId, remindAt, taskId, userId) as
-      | Reminder
-      | undefined) ?? null
+    typeof err === "object" &&
+    err !== null &&
+    (err as { errcode?: number }).errcode === 2067
   );
 }
 
@@ -163,6 +206,34 @@ export function removeReminder(userId: number, id: number): Reminder | null {
 /** `now` is local wall time as "YYYY-MM-DD HH:MM" — the same shape we store. */
 export function dueReminders(now: string): DueReminder[] {
   return selectDue.all(now) as unknown as DueReminder[];
+}
+
+/**
+ * An existing pending reminder for exactly this task and minute, if any.
+ *
+ * Checking before inserting is race-free here rather than merely lucky:
+ * `DatabaseSync` is synchronous and JavaScript is single-threaded, so no other
+ * handler can interleave between the check and the insert. The unique index is
+ * the backstop for the case that isn't true — a second bot process.
+ */
+export function pendingReminderAt(
+  userId: number,
+  taskId: number,
+  remindAt: string,
+): Reminder | null {
+  return (
+    (selectPendingAt.get(userId, taskId, remindAt) as Reminder | undefined) ??
+    null
+  );
+}
+
+/**
+ * Still unsent and still there. A delivery pass selects its batch up front, and
+ * the user can delete the task (cascading the reminder away) while an earlier
+ * send in that same batch is still in flight.
+ */
+export function isStillPending(id: number): boolean {
+  return selectStillPending.get(id) !== undefined;
 }
 
 export function markSent(id: number, when: string): void {

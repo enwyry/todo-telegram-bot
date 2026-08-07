@@ -5,9 +5,11 @@ import {
   closeDb,
   dueReminders,
   getTask,
+  isStillPending,
   listReminders,
   listTasks,
   markSent,
+  pendingReminderAt,
   removeReminder,
   removeTask,
   setDeadline,
@@ -17,6 +19,7 @@ import {
 } from "./db.ts";
 import {
   datePicker,
+  dateIsSelectable,
   formatDeadline,
   hourPicker,
   isOverdue,
@@ -70,16 +73,53 @@ export function isNoOpEditFailure(
   return /message is not modified/i.test(res.description ?? "");
 }
 
-bot.api.config.use(async (prev, method, payload, signal) => {
-  // grammY turns an `ok: false` response into a GrammyError *after* the
-  // transformer stack, so this has to inspect the response — a try/catch here
-  // would never fire.
-  const res = await prev(method, payload, signal);
-  if (isNoOpEditFailure(method, res)) {
-    return { ok: true, result: true } as typeof res;
+/**
+ * Exported so it can be tested directly. grammY installs transformers
+ * outermost-last, so a test stub added after this one sits *outside* it and its
+ * failures would never reach it — re-installing this guard on top of the stub
+ * is what lets a test exercise the real thing.
+ */
+export const apiGuard: Parameters<typeof bot.api.config.use>[0] = async (
+  prev,
+  method,
+  payload,
+  signal,
+) => {
+  type Response = Awaited<ReturnType<typeof prev>>;
+  /** Report success upwards — both cases below are cosmetic-only. */
+  const ignored = { ok: true, result: true } as unknown as Response;
+
+  // Answering a callback query only dismisses the client's spinner and shows a
+  // toast. Every handler answers *before* editing the message it's confirming,
+  // so letting a failure here propagate would abort the handler after its
+  // database write had already landed: the reminder exists, but the user sees
+  // no confirmation and a still-live keyboard — and taps again, duplicating it.
+  // The spinner clears on its own, so this is logged and the handler carries on
+  // to the part the user actually sees. Both shapes of failure are covered: an
+  // `ok: false` body, and a throw from the transport (timeout, DNS, reset).
+  const cosmetic = method === "answerCallbackQuery";
+
+  try {
+    // grammY turns an `ok: false` response into a GrammyError *after* the
+    // transformer stack, so these have to inspect the response — a catch alone
+    // would never see them.
+    const res = await prev(method, payload, signal);
+    if (isNoOpEditFailure(method, res)) return ignored;
+    if (!res.ok && cosmetic) {
+      console.warn(`answerCallbackQuery failed (ignored): ${res.description}`);
+      return ignored;
+    }
+    return res;
+  } catch (err) {
+    if (cosmetic) {
+      console.warn("answerCallbackQuery failed (ignored):", err);
+      return ignored;
+    }
+    throw err;
   }
-  return res;
-});
+};
+
+bot.api.config.use(apiGuard);
 
 /**
  * Private chats only.
@@ -118,10 +158,21 @@ function esc(text: string): string {
 
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
-/** Truncates by grapheme, so an emoji is never cut into a broken half-character. */
+/**
+ * Truncates by grapheme, so an emoji is never cut into a broken half-character.
+ *
+ * A grapheme has no bound on its own length — "e" plus 400 combining accents is
+ * one — so the result is capped in code units too, or a label of "28 characters"
+ * could still run to thousands and blow up the keyboard it sits in. That second
+ * cut is by code point, which cannot split a surrogate pair even mid-cluster.
+ */
 function truncate(text: string, max: number): string {
   const parts = [...graphemes.segment(text)].map((s) => s.segment);
-  return parts.length <= max ? text : `${parts.slice(0, max - 1).join("")}…`;
+  const short = parts.length <= max ? text : `${parts.slice(0, max - 1).join("")}…`;
+
+  const ceiling = max * 4;
+  if (short.length <= ceiling) return short;
+  return `${[...short].slice(0, ceiling - 1).join("")}…`;
 }
 
 /** Button label — always carries the date/time so tasks are identifiable at a glance. */
@@ -141,6 +192,9 @@ function describe(task: Task): string {
 
 /** Telegram rejects anything longer than this (verified: 4096 ok, 4097 not). */
 const TELEGRAM_TEXT_LIMIT = 4096;
+
+/** ~48k characters of tasks. Past this, /list is a flood rather than a list. */
+const MAX_LIST_CHUNKS = 12;
 
 /**
  * Sends `lines` as however many messages it takes. A single 500-character task
@@ -169,30 +223,74 @@ async function replyInChunks(ctx: ReplyCtx, lines: string[]): Promise<void> {
   }
   if (current) chunks.push(current);
 
-  for (const chunk of chunks) {
+  // Firing dozens of messages back to back trips Telegram's flood limit, and
+  // then the tail of the list is dropped with no explanation. Far more text
+  // than anyone reads in one go, so the rest is summarised instead.
+  const shown = chunks.slice(0, MAX_LIST_CHUNKS);
+  if (chunks.length > shown.length) {
+    shown.push(
+      `<i>…and ${chunks.length - shown.length} more screens' worth. ` +
+        `Clear a few with /remove to see the rest.</i>`,
+    );
+  }
+
+  for (const chunk of shown) {
     await ctx.reply(chunk, { parse_mode: "HTML" });
   }
 }
 
-function taskKeyboard(tasks: Task[], prefix: "rm" | "rem"): InlineKeyboard {
+/**
+ * An over-large request is rejected outright, and a rejected keyboard means no
+ * reply at all — the command just appears to do nothing. Buttons are added only
+ * while the serialised keyboard stays inside a conservative budget, and the
+ * caller says how many were left out. Both lists are ordered soonest-first, so
+ * what drops off the end is the least urgent. For any ordinary list this is
+ * reached by nobody and changes nothing.
+ */
+const KEYBOARD_BUDGET_BYTES = 8_000;
+
+type Fitted = { keyboard: InlineKeyboard; hidden: number };
+
+function fitButtons<T>(
+  items: T[],
+  label: (item: T) => string,
+  data: (item: T) => string,
+): Fitted {
   const keyboard = new InlineKeyboard();
-  for (const task of tasks) {
-    keyboard.text(taskLabel(task), `${prefix}:${task.id}`).row();
+  let bytes = 0;
+
+  for (const [i, item] of items.entries()) {
+    const text = label(item);
+    const callbackData = data(item);
+    bytes += Buffer.byteLength(
+      JSON.stringify([{ text, callback_data: callbackData }]),
+      "utf8",
+    );
+    if (bytes > KEYBOARD_BUDGET_BYTES) {
+      return { keyboard, hidden: items.length - i };
+    }
+    keyboard.text(text, callbackData).row();
   }
-  return keyboard;
+
+  return { keyboard, hidden: 0 };
 }
 
-function reminderKeyboard(reminders: Reminder[]): InlineKeyboard {
-  const keyboard = new InlineKeyboard();
-  for (const r of reminders) {
-    keyboard
-      .text(
-        `🔔 ${formatDeadline(r.remind_at)} · ${truncate(r.text, 22)}`,
-        `rmr:${r.id}`,
-      )
-      .row();
-  }
-  return keyboard;
+/** Appends an honest note rather than silently showing a shortened list. */
+function withHidden(text: string, hidden: number): string {
+  if (hidden === 0) return text;
+  return `${text}\n\n<i>(showing the first few — ${hidden} more not listed)</i>`;
+}
+
+function taskKeyboard(tasks: Task[], prefix: "rm" | "rem"): Fitted {
+  return fitButtons(tasks, taskLabel, (t) => `${prefix}:${t.id}`);
+}
+
+function reminderKeyboard(reminders: Reminder[]): Fitted {
+  return fitButtons(
+    reminders,
+    (r) => `🔔 ${formatDeadline(r.remind_at)} · ${truncate(r.text, 22)}`,
+    (r) => `rmr:${r.id}`,
+  );
 }
 
 /**
@@ -298,8 +396,10 @@ bot.command("reminder", async (ctx) => {
     return;
   }
 
-  await ctx.reply("Remind you about which task?", {
-    reply_markup: taskKeyboard(tasks, "rem"),
+  const { keyboard, hidden } = taskKeyboard(tasks, "rem");
+  await ctx.reply(withHidden("Remind you about which task?", hidden), {
+    parse_mode: "HTML",
+    reply_markup: keyboard,
   });
 });
 
@@ -317,8 +417,10 @@ bot.command("remove", async (ctx) => {
   // Only ask task-or-reminder when there's actually a reminder to choose.
   const reminders = listReminders(userId);
   if (reminders.length === 0) {
-    await ctx.reply("Which one is done?", {
-      reply_markup: taskKeyboard(tasks, "rm"),
+    const { keyboard, hidden } = taskKeyboard(tasks, "rm");
+    await ctx.reply(withHidden("Which one is done?", hidden), {
+      parse_mode: "HTML",
+      reply_markup: keyboard,
     });
     return;
   }
@@ -461,9 +563,18 @@ bot.callbackQuery(/^cancel:(\d+)$/, async (ctx) => {
 // ── Remove flow ────────────────────────────────────────────────────────────
 
 bot.callbackQuery("rmenu:t", async (ctx) => {
+  const tasks = listTasks(ctx.from.id);
   await ctx.answerCallbackQuery();
-  await ctx.editMessageText("Which one is done?", {
-    reply_markup: taskKeyboard(listTasks(ctx.from.id), "rm"),
+  // The menu was drawn when tasks existed; they can be gone by the time it's
+  // tapped. Without this the reply is a question with nothing to answer it.
+  if (tasks.length === 0) {
+    await ctx.editMessageText("Nothing left to remove. 🎉");
+    return;
+  }
+  const { keyboard, hidden } = taskKeyboard(tasks, "rm");
+  await ctx.editMessageText(withHidden("Which one is done?", hidden), {
+    parse_mode: "HTML",
+    reply_markup: keyboard,
   });
 });
 
@@ -474,8 +585,10 @@ bot.callbackQuery("rmenu:r", async (ctx) => {
     await ctx.editMessageText("No reminders pending.");
     return;
   }
-  await ctx.editMessageText("Which reminder should I drop?", {
-    reply_markup: reminderKeyboard(reminders),
+  const { keyboard, hidden } = reminderKeyboard(reminders);
+  await ctx.editMessageText(withHidden("Which reminder should I drop?", hidden), {
+    parse_mode: "HTML",
+    reply_markup: keyboard,
   });
 });
 
@@ -545,9 +658,10 @@ bot.callbackQuery(/^rmr:(\d+)$/, async (ctx) => {
     return;
   }
 
-  await ctx.editMessageText(`${header}\n\nAnything else?`, {
+  const { keyboard, hidden } = reminderKeyboard(remaining);
+  await ctx.editMessageText(withHidden(`${header}\n\nAnything else?`, hidden), {
     parse_mode: "HTML",
-    reply_markup: reminderKeyboard(remaining),
+    reply_markup: keyboard,
   });
 });
 
@@ -567,9 +681,10 @@ async function deleteTaskNow(ctx: PickerCtx, taskId: number): Promise<void> {
     return;
   }
 
-  await ctx.editMessageText(`${header}\n\nAnything else?`, {
+  const { keyboard, hidden } = taskKeyboard(remaining, "rm");
+  await ctx.editMessageText(withHidden(`${header}\n\nAnything else?`, hidden), {
     parse_mode: "HTML",
-    reply_markup: taskKeyboard(remaining, "rm"),
+    reply_markup: keyboard,
   });
 }
 
@@ -618,42 +733,76 @@ async function finishDeadline(
  * reminder, and returns the message to show. Shared by the minute buttons and
  * the typed-time path so both behave identically.
  */
+/**
+ * `retry` distinguishes "that time won't do, give me another" from "this task
+ * is gone, nothing you type will help" — the typed-time prompt stays armed only
+ * for the first.
+ */
+type Commit =
+  | { ok: true; text: string }
+  | { ok: false; text: string; retry: boolean };
+
+const gone = { ok: false, text: "That task no longer exists.", retry: false } as const;
+
 function commitWhen(
   mode: Mode,
   userId: number,
   taskId: number,
   when: string,
-): { ok: true; text: string } | { ok: false; text: string } {
+): Commit {
   if (mode === "d") {
     const task = setDeadline(userId, taskId, when);
-    if (!task) return { ok: false, text: "That task no longer exists." };
+    if (!task) return gone;
     return {
       ok: true,
       text: `✅ Added ${describe(task)}\n\n<i>Want a nudge? /reminder</i>`,
     };
   }
 
+  const task = getTask(userId, taskId);
+  if (!task) return gone;
+
+  const bounds = boundsFor("r", task);
+
+  // Asking for another time is only worth it if some time on the day they
+  // already chose would actually be accepted. Once that day is behind us — the
+  // prompt sat open past midnight, say — every answer would be refused, and
+  // staying armed would trap them in a loop that eats their next message too.
+  const retry = dateIsSelectable(when.slice(0, 10), bounds);
+
   // A reminder in the past would fire the moment it's saved.
   if (when <= nowLocal()) {
-    return { ok: false, text: "That time has already passed — pick a later one." };
+    return {
+      ok: false,
+      retry,
+      text: retry
+        ? "That time has already passed — pick a later one."
+        : "That day is behind us now. Start again with /reminder.",
+    };
   }
-
-  const task = getTask(userId, taskId);
-  if (!task) return { ok: false, text: "That task no longer exists." };
 
   // The keyboard already hides these, but a typed time or a forged callback
   // could still land here, so the rule is enforced where it actually counts.
-  const bounds = boundsFor("r", task);
   if (bounds.max && when > bounds.max && task.deadline) {
     return {
       ok: false,
+      retry,
       text: `That's after the deadline (${formatDeadline(task.deadline)}). Pick an earlier time.`,
     };
   }
 
-  if (!addReminder(userId, taskId, when)) {
-    return { ok: false, text: "That task no longer exists." };
+  // Setting the same minute twice — by tapping a button whose confirmation
+  // hasn't landed yet, or just by going through /reminder again — would store a
+  // second identical row and ping twice at that minute. Several reminders on
+  // one task are still fine; only an exact repeat is folded into the first.
+  if (pendingReminderAt(userId, taskId, when)) {
+    return {
+      ok: true,
+      text: `🔔 Already set: I'll remind you about <b>${esc(task.text)}</b> on <b>${formatDeadline(when)}</b>.`,
+    };
   }
+
+  if (!addReminder(userId, taskId, when)) return gone;
 
   return {
     ok: true,
@@ -677,13 +826,18 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
-    awaitingTime.delete(ctx.chat.id);
     const result = commitWhen(
       pending.mode,
       userId,
       pending.taskId,
       `${pending.date} ${time}`,
     );
+    // Stay armed when the refusal asks for another time ("that time has
+    // passed", "that's after the deadline") — otherwise the correction the bot
+    // just asked for lands in a bot no longer listening, and is met with
+    // silence. A task that no longer exists is not retryable, so that one lets
+    // go rather than looping.
+    if (result.ok || !result.retry) awaitingTime.delete(ctx.chat.id);
     await ctx.reply(result.text, { parse_mode: "HTML" });
     return;
   }
@@ -729,8 +883,66 @@ async function saveTask(ctx: ReplyCtx, text: string): Promise<void> {
 /** At most this many per pass, so an outage backlog is drained steadily. */
 const REMINDERS_PER_PASS = 25;
 
+/** Per-send ceiling. An aborted send is transient, so the reminder is retried. */
+const SEND_TIMEOUT_MS = 20_000;
+
+/** How long shutdown waits for a pass to finish before giving up on it. */
+const SHUTDOWN_GRACE_MS = 8_000;
+
+/** Node's native AbortSignal, retyped for grammY's vendored abort-controller. */
+function timeoutSignal(ms: number) {
+  return AbortSignal.timeout(ms) as unknown as Parameters<
+    typeof bot.api.sendMessage
+  >[3];
+}
+
 /** Non-null while a pass is running, so ticks can't overlap and shutdown can wait. */
 let inFlight: Promise<unknown> | null = null;
+
+/** Set once shutdown starts, so a pass stops after its current send. */
+let shuttingDown = false;
+
+/**
+ * Waits for an in-flight delivery pass, then closes the database.
+ *
+ * The wait is bounded, because a supervisor SIGKILLs a few seconds after
+ * SIGTERM and hanging past that is worse than giving up. But the database is
+ * closed *only* if the pass actually finished. Closing it under a live send
+ * finalizes the prepared statements, so `markSent` fails for a reminder
+ * Telegram has already delivered and it fires again on the next start — which
+ * is exactly the bug the unconditional wait was introduced to fix. Leaving the
+ * handle open costs nothing: every write is already committed, and WAL recovers
+ * on the next open.
+ *
+ * Exported so the regression can be tested; the grace is a parameter for the
+ * same reason.
+ */
+export async function drainAndClose(
+  graceMs: number = SHUTDOWN_GRACE_MS,
+): Promise<boolean> {
+  shuttingDown = true;
+
+  // deliverOnce never rejects, so `.then` here can't produce a stray rejection.
+  const finished = inFlight
+    ? await Promise.race([
+        inFlight.then(() => true),
+        new Promise<boolean>((resolve) => {
+          setTimeout(() => resolve(false), graceMs).unref();
+        }),
+      ])
+    : true;
+
+  if (!finished) {
+    console.warn(
+      "Shutdown grace expired with a send still in flight — leaving the " +
+        "database open so a delivered reminder still gets marked sent.",
+    );
+    return false;
+  }
+
+  closeDb();
+  return true;
+}
 
 /**
  * The chat is gone for good — retrying would spin forever. Anything else
@@ -775,10 +987,27 @@ async function deliverOnce(): Promise<number> {
     }
 
     for (const r of batch) {
+      // Shutting down: stop after the send already in flight rather than
+      // working through 24 more while a supervisor counts down to SIGKILL.
+      // Whatever is left is still pending and goes out on the next start.
+      if (shuttingDown) break;
+
+      // The batch was chosen before the first send; by now the user may have
+      // dropped this reminder, or deleted the task and cascaded it away, while
+      // an earlier send in the same batch was in flight. Sending anyway would
+      // ping them about something they just cancelled.
+      if (!isStillPending(r.id)) continue;
+
       try {
-        await bot.api.sendMessage(r.user_id, `🔔 <b>Reminder</b>\n${esc(r.text)}`, {
-          parse_mode: "HTML",
-        });
+        await bot.api.sendMessage(
+          r.user_id,
+          `🔔 <b>Reminder</b>\n${esc(r.text)}`,
+          { parse_mode: "HTML" },
+          // grammY's default is 500s. A stalled connection would hold `inFlight`
+          // for that long — sixteen missed ticks, and a shutdown that blocks
+          // past the grace period a supervisor allows before SIGKILL.
+          timeoutSignal(SEND_TIMEOUT_MS),
+        );
         markSent(r.id, nowLocal());
         sent++;
       } catch (err) {
@@ -833,18 +1062,15 @@ if (!process.env.BOT_TEST_MODE) {
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.once(signal, () => {
       clearInterval(timer);
-      // Let an in-flight pass finish first. Closing the database under it would
-      // finalize the statements mid-send, so a reminder that was actually
-      // delivered would never be marked sent and would fire again on restart.
       void (async () => {
+        // Stop taking new updates first, then let the pass already running
+        // finish before the database goes away.
         try {
-          if (inFlight) await inFlight;
           await bot.stop();
         } catch (err) {
           console.error("Error during shutdown:", err);
-        } finally {
-          closeDb();
         }
+        await drainAndClose();
       })();
     });
   }

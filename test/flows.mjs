@@ -32,7 +32,16 @@ let outbox = [];
 let failWith = null;
 let sendDelayMs = 0;
 
-bot.api.config.use(async (_prev, method, payload) => {
+/** Set to return an `ok: false` body — the shape Telegram actually sends. */
+let respondWith = null;
+/** Records the AbortSignal each call was given, so timeouts can be asserted. */
+let lastSignal = new Map();
+/** Set to a promise; sendMessage waits on it, standing in for a stalled send. */
+let sendGate = null;
+
+bot.api.config.use(async (_prev, method, payload, signal) => {
+  lastSignal.set(method, signal);
+  if (method === "sendMessage" && sendGate) await sendGate;
   if (method === "sendMessage" && sendDelayMs) {
     await new Promise((r) => setTimeout(r, sendDelayMs));
   }
@@ -40,6 +49,11 @@ bot.api.config.use(async (_prev, method, payload) => {
   if (err) {
     outbox.push({ method, payload, failed: true });
     throw err;
+  }
+  const bad = respondWith?.(method, payload);
+  if (bad) {
+    outbox.push({ method, payload, rejected: true });
+    return bad;
   }
   outbox.push({ method, payload });
   if (method === "answerCallbackQuery") return { ok: true, result: true };
@@ -268,9 +282,20 @@ console.log("\nguards");
 await tap(`min:r:${taskId}:2020-01-01:09:00`);
 {
   const answer = last("answerCallbackQuery").payload;
-  assert.match(answer.text, /passed/i, "past reminder should be refused");
+  // A day long gone gets the "start again" wording; an earlier time *today*
+  // gets "pick a later one", since that one is still worth retrying.
+  assert.match(answer.text, /behind us/i, "past reminder should be refused");
   assert.equal(db.listReminders(USER).length, 1, "past reminder must not be stored");
   pass("refuses a reminder in the past");
+}
+
+{
+  // Earlier today: still refused, but retryable, so it asks for another time.
+  const before = db.listReminders(USER).length;
+  await tap(`min:r:${taskId}:${ymd(new Date())}:00:00`);
+  assert.match(last("answerCallbackQuery").payload.text, /passed/i);
+  assert.equal(db.listReminders(USER).length, before, "past time today was stored");
+  pass("an earlier time today asks for a later one");
 }
 
 {
@@ -278,7 +303,7 @@ await tap(`min:r:${taskId}:2020-01-01:09:00`);
   const before = db.listReminders(USER).length;
   await tap(`type:r:${taskId}:2020-01-01`);
   await send("09:00");
-  assert.match(last("sendMessage").payload.text, /passed/i);
+  assert.match(last("sendMessage").payload.text, /behind us/i);
   assert.equal(db.listReminders(USER).length, before, "typed past reminder was stored");
   pass("refuses a typed reminder in the past");
 }
@@ -698,6 +723,387 @@ console.log("\n[fix] a no-op edit doesn't surface as an error");
   pass("only a genuine no-op edit is swallowed");
 }
 
-db.closeDb();
+// ═══ Second review: nine more defects, each reproduced before being fixed ══
+
+console.log("\n[fix2] the same reminder minute can't be stored twice");
+{
+  for (const t of db.listTasks(USER)) db.removeTask(USER, t.id);
+  const t = db.addTask(USER, "call the dentist");
+  const d = futureDate();
+
+  await tap(`min:r:${t.id}:${d}:09:00`);
+  await tap(`min:r:${t.id}:${d}:09:00`); // the confirmation hasn't landed yet
+  assert.equal(
+    db.taskReminders(USER, t.id).length,
+    1,
+    "a repeated minute stored a duplicate reminder",
+  );
+  assert.match(last("editMessageText").payload.text, /already set/i,
+    "the repeat should say it was already set, not pretend it added one");
+  pass("a repeated tap folds into the existing reminder");
+
+  // Different minutes on one task must still work — that's a feature.
+  await tap(`min:r:${t.id}:${d}:10:00`);
+  assert.equal(db.taskReminders(USER, t.id).length, 2,
+    "several reminders on one task must still be allowed");
+  pass("different minutes on the same task are unaffected");
+
+  // The database refuses it too, without throwing, for a second process.
+  const again = db.addReminder(USER, t.id, `${d} 09:00`);
+  const existing = db.taskReminders(USER, t.id).find((r) => r.remind_at === `${d} 09:00`);
+  assert.equal(again?.id, existing.id, "addReminder should hand back the existing row");
+  assert.equal(db.taskReminders(USER, t.id).length, 2, "still no duplicate");
+  pass("the unique index degrades gracefully instead of throwing");
+  db.removeTask(USER, t.id);
+}
+
+console.log("\n[fix2] a failed answerCallbackQuery doesn't abort the handler");
+{
+  const { apiGuard } = await import("../src/bot.ts");
+  // grammY installs transformers outermost-last, so the stub above sits outside
+  // the bot's own guard and its throw would never reach it. Re-installing the
+  // guard on top of the stub puts the real thing back in the path.
+  bot.api.config.use(apiGuard);
+
+  const t = db.addTask(USER, "pay rent");
+  const d = futureDate();
+
+  failWith = (m) =>
+    m === "answerCallbackQuery" ? tgError(400, "Bad Request: query is too old", m) : null;
+  await tap(`min:r:${t.id}:${d}:11:00`);
+  failWith = null;
+
+  assert.equal(db.taskReminders(USER, t.id).length, 1, "the write should still land");
+  assert.ok(
+    last("editMessageText"),
+    "the handler stopped at the failed answer — no confirmation was ever sent",
+  );
+  assert.match(last("editMessageText").payload.text, /remind you/i);
+  pass("the confirmation still arrives when the toast fails");
+
+  // ...so the user never re-taps a live keyboard, and never duplicates the row.
+  await tap(`min:r:${t.id}:${d}:11:00`);
+  assert.equal(db.taskReminders(USER, t.id).length, 1, "the retry duplicated it");
+  pass("no duplicate from retrying after a failed answer");
+
+  // The path a REAL "query is too old" takes. grammY resolves with the raw
+  // `ok: false` body and only converts it to an error afterwards, so the guard's
+  // response branch — not its catch — is what runs in production. Without this
+  // the branch could be deleted and the suite would stay green.
+  const t2 = db.addTask(USER, "file taxes");
+  respondWith = (m) =>
+    m === "answerCallbackQuery"
+      ? { ok: false, error_code: 400, description: "Bad Request: query is too old" }
+      : null;
+  await tap(`min:r:${t2.id}:${d}:12:00`);
+  respondWith = null;
+
+  assert.equal(db.taskReminders(USER, t2.id).length, 1, "the write should still land");
+  assert.ok(
+    last("editMessageText"),
+    "an ok:false answer aborted the handler — the response branch is missing",
+  );
+  pass("the ok:false answer is swallowed too, not just a thrown one");
+  db.removeTask(USER, t2.id);
+
+  // A genuine failure of something that matters must still surface, in both
+  // shapes, or the guard is swallowing far too much.
+  failWith = (m) => (m === "sendMessage" ? tgError(400, "Bad Request: nope") : null);
+  let surfaced = false;
+  try {
+    await bot.api.sendMessage(USER, "x");
+  } catch {
+    surfaced = true;
+  }
+  failWith = null;
+  assert.ok(surfaced, "the guard must not swallow a thrown send failure");
+
+  respondWith = (m) =>
+    m === "sendMessage"
+      ? { ok: false, error_code: 400, description: "Bad Request: nope" }
+      : null;
+  surfaced = false;
+  try {
+    await bot.api.sendMessage(USER, "x");
+  } catch {
+    surfaced = true;
+  }
+  respondWith = null;
+  assert.ok(surfaced, "the guard must not swallow an ok:false send failure");
+  pass("only the cosmetic call is swallowed, in either shape");
+  db.removeTask(USER, t.id);
+}
+
+console.log("\n[fix2] a reminder cancelled mid-pass isn't delivered");
+{
+  const a = db.addTask(USER, "task A");
+  const b = db.addTask(USER, "task B");
+  db.addReminder(USER, a.id, "2020-01-01 09:00");
+  db.addReminder(USER, b.id, "2020-01-01 09:00");
+
+  outbox.length = 0;
+  let dropped = false;
+  failWith = (m) => {
+    // Delete task B while task A's send is still in flight — exactly what a tap
+    // on "Delete anyway" does, since grammY dispatches updates concurrently.
+    if (m === "sendMessage" && !dropped) {
+      dropped = true;
+      db.removeTask(USER, b.id);
+    }
+    return null;
+  };
+  await deliverDueReminders();
+  failWith = null;
+
+  const texts = outbox.filter((o) => o.method === "sendMessage").map((o) => o.payload.text);
+  assert.equal(texts.length, 1, `expected only task A's reminder, got ${texts.length}`);
+  assert.ok(texts[0].includes("task A"));
+  assert.ok(!texts.some((t) => t.includes("task B")), "reminder sent for a deleted task");
+  pass("the batch is re-checked before each send");
+  for (const t of db.listTasks(USER)) db.removeTask(USER, t.id);
+}
+
+console.log("\n[fix2] a refused typed time still listens for the correction");
+{
+  const t = db.addTask(USER, "renew passport");
+  const d = futureDate();
+  db.setDeadline(USER, t.id, `${d} 12:00`);
+
+  await tap(`type:r:${t.id}:${d}`);
+  await send("23:59"); // past the deadline -> refused
+  assert.match(last("sendMessage").payload.text, /after the deadline/i);
+
+  await send("11:00"); // the correction it just asked for
+  assert.ok(last("sendMessage"), "the corrected time was met with silence");
+  assert.match(last("sendMessage").payload.text, /remind you/i);
+  assert.equal(db.taskReminders(USER, t.id).length, 1, "the correction wasn't saved");
+  pass("the prompt stays armed across a refusal");
+
+  // But a task that's gone is not retryable, so that one lets go.
+  await tap(`type:r:${t.id}:${d}`);
+  db.removeTask(USER, t.id);
+  await send("09:00");
+  assert.match(last("sendMessage").payload.text, /no longer exists/i);
+  await send("09:30");
+  assert.equal(
+    last("sendMessage")?.payload.text ?? null,
+    null,
+    "a dead prompt should stand down, not keep answering",
+  );
+  pass("an unrecoverable refusal stands down");
+
+  // Nor is a day that has fully passed. Staying armed there would refuse every
+  // possible answer forever and swallow ordinary messages along the way — the
+  // prompt left open past midnight.
+  const t3 = db.addTask(USER, "water the plants");
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  await tap(`type:r:${t3.id}:${ymd(yesterday)}`);
+  await send("09:00");
+  assert.match(last("sendMessage").payload.text, /behind us/i,
+    "should say the day is gone, not ask for a later time it can't accept");
+
+  await send("23:59");
+  assert.equal(
+    last("sendMessage")?.payload.text ?? null,
+    null,
+    "the prompt stayed armed on an unsatisfiable day — an endless refusal loop",
+  );
+  assert.equal(db.taskReminders(USER, t3.id).length, 0);
+  pass("an unsatisfiable day stands down instead of looping");
+  db.removeTask(USER, t3.id);
+}
+
+console.log("\n[fix2] the startup migration collapses pre-existing duplicates");
+{
+  // db.ts is a module singleton, so the migration only ever runs once per
+  // process — it needs a fresh one to be exercised at all.
+  const { execFileSync } = await import("node:child_process");
+  const { DatabaseSync } = await import("node:sqlite");
+  const legacy = join(workdir, "legacy.db");
+
+  const old = new DatabaseSync(legacy);
+  old.exec(`
+    CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+      text TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), deadline TEXT);
+    CREATE TABLE reminders (id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL, remind_at TEXT NOT NULL, sent_at TEXT);
+    INSERT INTO tasks (id, user_id, text) VALUES (1, 7, 'dentist'), (2, 7, 'rent');
+    INSERT INTO reminders (task_id, user_id, remind_at, sent_at) VALUES
+      (1, 7, '2030-01-01 09:00', NULL), (1, 7, '2030-01-01 09:00', NULL),
+      (1, 7, '2030-01-01 09:00', NULL), (1, 7, '2030-01-02 09:00', NULL),
+      (2, 7, '2030-01-01 09:00', NULL), (2, 7, '2030-01-01 09:00', NULL),
+      (1, 7, '2020-05-05 08:00', '2020-05-05 08:00'),
+      (1, 7, '2020-05-05 08:00', '2020-05-05 08:01');
+  `);
+  old.close();
+
+  const out = execFileSync(
+    process.execPath,
+    [
+      "-e",
+      `import(${JSON.stringify(new URL("../src/db.ts", import.meta.url).href)}).then((m) => {
+         const pending = m.listReminders(7).map((r) => r.remind_at);
+         const { DatabaseSync } = require("node:sqlite");
+         m.closeDb();
+         const d = new DatabaseSync(process.env.DB_PATH, { readOnly: true });
+         const sent = d.prepare("SELECT COUNT(*) c FROM reminders WHERE sent_at IS NOT NULL").get().c;
+         const tasks = d.prepare("SELECT COUNT(*) c FROM tasks").get().c;
+         d.close();
+         console.log(JSON.stringify({ pending, sent, tasks }));
+       });`,
+    ],
+    { env: { ...process.env, DB_PATH: legacy }, encoding: "utf8" },
+  );
+
+  const got = JSON.parse(out.trim().split("\n").at(-1));
+  // Three duplicates on task 1 collapse to one; task 2's same-time reminder is a
+  // different task, so it survives — that pairing is legitimate.
+  assert.deepEqual(
+    got.pending.sort(),
+    ["2030-01-01 09:00", "2030-01-01 09:00", "2030-01-02 09:00"],
+    `migration produced ${JSON.stringify(got.pending)}`,
+  );
+  assert.equal(got.sent, 2, "sent history must not be touched — it isn't constrained");
+  assert.equal(got.tasks, 2, "tasks must survive the migration");
+  pass("6 duplicated pending rows -> 3, history and tasks intact");
+}
+
+console.log("\n[fix2] the remove menu can't offer an empty list");
+{
+  for (const t of db.listTasks(USER)) db.removeTask(USER, t.id);
+  const t = db.addTask(USER, "only task");
+  db.addReminder(USER, t.id, `${futureDate()} 09:00`);
+
+  await send("/remove"); // menu drawn while it still had contents
+  db.removeTask(USER, t.id); // ...and then everything goes
+  await tap("rmenu:t");
+
+  const msg = last("editMessageText").payload;
+  const rows = (msg.reply_markup?.inline_keyboard ?? []).flat();
+  assert.equal(rows.length, 0);
+  assert.match(msg.text, /nothing left/i, "a question with no answers was shown");
+  pass("says there's nothing left instead of asking an unanswerable question");
+}
+
+console.log("\n[fix2] a button label is bounded in length, not just graphemes");
+{
+  // One grapheme, 400 code units. The old cap counted clusters, so this slipped
+  // through whole and could blow up the keyboard it sat in.
+  const zalgo = "e" + "́".repeat(400);
+  const t = db.addTask(USER, `${zalgo} meet`);
+  db.setDeadline(USER, t.id, `${futureDate()} 09:00`);
+  await send("/remove");
+  const label = buttons()[0].label;
+  assert.ok(label.length < 200, `label is still ${label.length} code units`);
+  const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  assert.ok(!lone.test(label), "the second cut broke a surrogate pair");
+  pass(`capped to ${label.length} code units, no broken pair`);
+  db.removeTask(USER, t.id);
+}
+
+console.log("\n[fix2] keyboards and /list stay within what Telegram accepts");
+{
+  for (const t of db.listTasks(USER)) db.removeTask(USER, t.id);
+  for (let i = 0; i < 300; i++) db.addTask(USER, `task number ${i} with an ordinary name`);
+
+  await send("/remove");
+  const kb = [...outbox].reverse().find((o) => o.payload?.reply_markup).payload;
+  const bytes = Buffer.byteLength(JSON.stringify(kb.reply_markup), "utf8");
+  assert.ok(bytes < 10_000, `keyboard serialized to ${bytes} bytes`);
+  assert.match(kb.text, /more not listed/i, "silently dropped the rest of the list");
+  pass(`300 tasks -> ${kb.reply_markup.inline_keyboard.flat().length} buttons, ${bytes} bytes, and it says so`);
+
+  // A small list must be completely untouched by that cap.
+  for (const t of db.listTasks(USER)) db.removeTask(USER, t.id);
+  for (let i = 0; i < 5; i++) db.addTask(USER, `small ${i}`);
+  await send("/remove");
+  const small = [...outbox].reverse().find((o) => o.payload?.reply_markup).payload;
+  assert.equal(small.reply_markup.inline_keyboard.flat().length, 5);
+  assert.ok(!/more not listed/i.test(small.text), "an ordinary list should say nothing");
+  pass("an ordinary list is unchanged");
+
+  // /list stops before it becomes a flood.
+  for (const t of db.listTasks(USER)) db.removeTask(USER, t.id);
+  for (let i = 0; i < 60; i++) db.addTask(USER, "&".repeat(500));
+  await send("/list");
+  const msgs = outbox.filter((o) => o.method === "sendMessage");
+  assert.ok(msgs.length <= 13, `/list sent ${msgs.length} messages back to back`);
+  assert.match(msgs.at(-1).payload.text, /more screens/i, "the tail vanished silently");
+  for (const m of msgs) assert.ok(m.payload.text.length <= 4096);
+  pass(`60 huge tasks -> ${msgs.length} messages, the rest summarised`);
+  for (const t of db.listTasks(USER)) db.removeTask(USER, t.id);
+}
+
+console.log("\n[fix2] a stalled send can't wedge delivery or shutdown");
+{
+  const t = db.addTask(USER, "stalled");
+  db.addReminder(USER, t.id, "2020-01-01 09:00");
+
+  // grammY's default is a 500s timeout; the send has to carry its own signal.
+  // Asserted by inspecting what the transport was actually handed, so removing
+  // the argument (or gutting the helper) fails here.
+  lastSignal = new Map();
+  await deliverDueReminders();
+  const signal = lastSignal.get("sendMessage");
+  assert.ok(signal, "the send was given no AbortSignal at all");
+  assert.equal(typeof signal.aborted, "boolean", `not a signal: ${signal}`);
+  assert.equal(signal.aborted, false, "the signal was already aborted");
+  assert.equal(typeof signal.addEventListener, "function");
+  pass("each reminder send carries a live abort signal");
+
+  // An aborted send is transient: the reminder must survive for the next pass.
+  const t2 = db.addTask(USER, "aborted");
+  db.addReminder(USER, t2.id, "2020-01-01 09:00");
+  failWith = () => Object.assign(new Error("aborted"), { name: "AbortError" });
+  const n = await deliverDueReminders();
+  failWith = null;
+  assert.equal(n, 0);
+  assert.equal(db.taskReminders(USER, t2.id).length, 1, "a timeout must not drop it");
+  pass("a timed-out send is retried, not discarded");
+  db.removeTask(USER, t.id);
+  db.removeTask(USER, t2.id);
+}
+
+// This one goes last: it flips the module's shutdown flag, after which delivery
+// deliberately stops early.
+console.log("\n[fix2] shutdown never closes the database under a live send");
+{
+  const { drainAndClose } = await import("../src/bot.ts");
+  const t = db.addTask(USER, "mid-flight");
+  db.addReminder(USER, t.id, "2020-01-01 09:00");
+
+  // A send that has reached Telegram but won't come back for 300ms. A real
+  // timer, not a bare promise: the grace timer is unref'd (in production an
+  // in-flight send holds a live socket), so nothing else would keep the loop up.
+  sendGate = new Promise((r) => setTimeout(r, 300));
+  const pass1 = deliverDueReminders();
+  await new Promise((r) => setImmediate(r));
+
+  // Shutdown gives up waiting while that send is still outstanding.
+  const closed = await drainAndClose(50);
+  assert.equal(closed, false, "the database was closed under an in-flight send");
+
+  // The send then completes. Before the fix this threw "statement has been
+  // finalized" and left sent_at NULL — so the user got the message and then got
+  // it a second time on the next start.
+  const delivered = await pass1;
+  sendGate = null;
+
+  assert.equal(delivered, 1, "the in-flight send was lost");
+  assert.equal(
+    db.taskReminders(USER, t.id).length,
+    0,
+    "a delivered reminder was left pending — it would fire again on restart",
+  );
+  pass("the pass finishes and marks its reminder sent");
+
+  // And when nothing is in flight, it does close, exactly as before.
+  assert.equal(await drainAndClose(50), true, "an idle shutdown should close the db");
+  pass("an idle shutdown still closes cleanly");
+}
+
+// drainAndClose already closed it above.
 rmSync(workdir, { recursive: true, force: true });
 console.log("\n✅ ALL FLOWS PASSED\n");

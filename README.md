@@ -107,10 +107,37 @@ prompt. The bot declines group chats rather than half-supporting them.
 **Long lists are split across messages.** Telegram's hard limit is 4096
 characters (verified: 4096 accepted, 4097 rejected), and escaping can quintuple
 a task's length (`&` becomes `&amp;`), so `/list` chunks rather than failing.
+Past a dozen chunks it stops and says how much is left, rather than firing off
+enough messages to trip a flood limit. Button lists are bounded the same way, by
+serialised size: an over-large keyboard is rejected outright, and a rejected
+keyboard means no reply at all. Both are ordered soonest-first, so what drops off
+is the least urgent — and neither bound is anywhere near an ordinary list.
 
 **Reminder passes never overlap.** A reminder is retired only after its send
 resolves, so a second pass starting mid-flight would re-send it. Passes are
-serialised, capped at 25 per tick, and stop early on a flood limit.
+serialised, capped at 25 per tick, and stop early on a flood limit. Each send
+carries its own 20-second timeout — grammY's default is 500 — so a stalled
+connection can't wedge every later pass behind it. The batch is chosen up front
+but re-checked before each send, so a reminder you cancel while an earlier one
+is still sending doesn't go out anyway.
+
+**Shutdown never closes the database under a live send.** It waits for the pass
+in flight, but only for a few seconds, because a supervisor sends SIGKILL not
+long after SIGTERM. If the grace runs out the handle is simply left open: every
+write is already committed and WAL recovers on the next start, whereas closing
+early would finalize the statements mid-send and leave a reminder Telegram had
+already delivered marked unsent — so it would arrive twice.
+
+**The same reminder can't be set twice.** Several reminders on one task are the
+point, but two at the same minute could only ever produce two identical
+messages, so an exact repeat folds into the existing one and says so. A unique
+index enforces it, and an older database has its duplicates collapsed on start.
+
+**A cosmetic API failure never aborts a handler.** Answering a callback query
+only dismisses the client's spinner, but it happens *before* the message the
+handler is confirming. Letting it throw would abandon the handler after its
+write had landed — the reminder saved, no confirmation shown, the keyboard still
+live and inviting a duplicate tap. It's logged and stepped over instead.
 
 The bot uses long polling, so it runs anywhere with outbound HTTPS — no public
 URL or webhook needed. Only one instance may run at a time; a second one will
