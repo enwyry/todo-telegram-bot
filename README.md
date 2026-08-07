@@ -9,7 +9,7 @@ Every user gets their own private list.
 | `/add`      | Add a task — `/add buy milk`, or send `/add` and reply with the text     |
 | `/list`     | All tasks, soonest first, with their date, time and pending reminders   |
 | `/reminder` | Pick a task, pick a date and time — the bot messages you when it's due  |
-| `/remove`   | Pick a task from a button list to delete it                             |
+| `/remove`   | Delete a task, or just one of its reminders                             |
 
 Pick dates and times **from buttons** — a month calendar, then an hour, then any
 of the 60 minutes. Or tap **⌨️ Type a time** and write `14:37` / `2:30pm` if
@@ -80,7 +80,16 @@ undated instead of leaking memory.
 callback button naming someone else's task id silently affects nothing.
 
 **Reminders** are rows with a `remind_at` and a null `sent_at`. A loop polls every
-30 seconds and sends whatever is due. Deleting a task cascades to its reminders.
+30 seconds and sends whatever is due.
+
+**A reminder can only land between now and its task's deadline.** The calendar
+greys out days past the deadline and the hour/minute grids simply omit times
+that are out of range, so the choice is only ever between valid options. The
+rule is re-checked in `commitWhen()` before writing, because a typed time or a
+forged callback never touches the keyboard.
+
+**Deleting a task cascades to its reminders**, so `/remove` names them and asks
+before going ahead. Dropping a reminder on its own leaves the task alone.
 
 The bot uses long polling, so it runs anywhere with outbound HTTPS — no public
 URL or webhook needed. Only one instance may run at a time; a second one will
@@ -96,8 +105,10 @@ fail with a `409 Conflict` from Telegram.
   stay due until delivered. Restarting after a long outage sends a burst.
 - Reminder polling is 30s, so delivery can land up to 30 seconds after the
   chosen minute.
-- **Deleting a task deletes its reminders.** That's the intended cascade, but it
-  means a `/remove` silently cancels anything pending for that task.
+- **An overdue task can't take a reminder at all** — every slot before its
+  deadline is in the past. `/reminder` says so rather than showing a dead
+  calendar, but it does mean "remind me tomorrow about this late thing" is not
+  currently expressible.
 
 ## Data
 

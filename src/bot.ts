@@ -8,8 +8,10 @@ import {
   listReminders,
   listTasks,
   markSent,
+  removeReminder,
   removeTask,
   setDeadline,
+  taskReminders,
   type Reminder,
   type Task,
 } from "./db.ts";
@@ -22,6 +24,7 @@ import {
   nowLocal,
   parseTime,
   ymd,
+  type Bounds,
   type Mode,
 } from "./pickers.ts";
 
@@ -84,6 +87,33 @@ function taskKeyboard(tasks: Task[], prefix: "rm" | "rem"): InlineKeyboard {
     keyboard.text(taskLabel(task), `${prefix}:${task.id}`).row();
   }
   return keyboard;
+}
+
+function reminderKeyboard(reminders: Reminder[]): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (const r of reminders) {
+    keyboard
+      .text(
+        `🔔 ${formatDeadline(r.remind_at)} · ${truncate(r.text, 22)}`,
+        `rmr:${r.id}`,
+      )
+      .row();
+  }
+  return keyboard;
+}
+
+/**
+ * A reminder is only useful between now and the task's deadline, so the picker
+ * is bounded to that window. An all-day deadline allows any time that day.
+ * Deadlines themselves are unbounded — the calendar already blocks past days.
+ */
+function boundsFor(mode: Mode, task: Task): Bounds {
+  if (mode === "d") return {};
+  if (!task.deadline) return { min: nowLocal() };
+  return {
+    min: nowLocal(),
+    max: task.deadline.includes(" ") ? task.deadline : `${task.deadline} 23:59`,
+  };
 }
 
 // ── Commands ───────────────────────────────────────────────────────────────
@@ -184,8 +214,20 @@ bot.command("remove", async (ctx) => {
     return;
   }
 
-  await ctx.reply("Which one is done?", {
-    reply_markup: taskKeyboard(tasks, "rm"),
+  // Only ask task-or-reminder when there's actually a reminder to choose.
+  const reminders = listReminders(userId);
+  if (reminders.length === 0) {
+    await ctx.reply("Which one is done?", {
+      reply_markup: taskKeyboard(tasks, "rm"),
+    });
+    return;
+  }
+
+  await ctx.reply("What do you want to remove?", {
+    reply_markup: new InlineKeyboard()
+      .text(`🗒 A task (${tasks.length})`, "rmenu:t")
+      .row()
+      .text(`🔔 A reminder (${reminders.length})`, "rmenu:r"),
   });
 });
 
@@ -200,10 +242,29 @@ bot.callbackQuery(/^rem:(\d+)$/, async (ctx) => {
   const task = getTask(ctx.from.id, taskId);
   if (!task) return expired(ctx);
 
+  // Reminders can't be scheduled past the deadline, so an overdue task has no
+  // valid slot at all. Say that outright rather than showing a dead calendar.
+  const window = boundsFor("r", task);
+  if (window.max && window.max <= nowLocal() && task.deadline) {
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      `<b>${esc(task.text)}</b> was due ${formatDeadline(task.deadline)}, which has passed — ` +
+        `there's no time left to remind you before it.\n\n` +
+        `Give it a new deadline with /add, or clear it with /remove.`,
+      { parse_mode: "HTML" },
+    );
+    return;
+  }
+
   await ctx.answerCallbackQuery();
   await ctx.editMessageText(`When should I remind you about <b>${esc(task.text)}</b>?`, {
     parse_mode: "HTML",
-    reply_markup: datePicker("r", taskId, ymd(new Date()).slice(0, 7)),
+    reply_markup: datePicker(
+      "r",
+      taskId,
+      ymd(new Date()).slice(0, 7),
+      boundsFor("r", task),
+    ),
   });
 });
 
@@ -216,7 +277,12 @@ bot.callbackQuery(/^cal:([dr]):(\d+):(\d{4}-\d{2})$/, async (ctx) => {
   await ctx.answerCallbackQuery();
   await ctx.editMessageText(prompt(mode, task.text), {
     parse_mode: "HTML",
-    reply_markup: datePicker(mode, taskId, ctx.match[3] ?? ""),
+    reply_markup: datePicker(
+      mode,
+      taskId,
+      ctx.match[3] ?? "",
+      boundsFor(mode, task),
+    ),
   });
 });
 
@@ -230,7 +296,10 @@ bot.callbackQuery(/^day:([dr]):(\d+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
   await ctx.answerCallbackQuery();
   await ctx.editMessageText(
     `<b>${esc(task.text)}</b>\n${formatDeadline(date)} — what time?`,
-    { parse_mode: "HTML", reply_markup: hourPicker(mode, taskId, date) },
+    {
+      parse_mode: "HTML",
+      reply_markup: hourPicker(mode, taskId, date, boundsFor(mode, task)),
+    },
   );
 });
 
@@ -245,7 +314,10 @@ bot.callbackQuery(/^hr:([dr]):(\d+):(\d{4}-\d{2}-\d{2}):(\d{2})$/, async (ctx) =
   await ctx.answerCallbackQuery();
   await ctx.editMessageText(
     `<b>${esc(task.text)}</b>\n${formatDeadline(date)} at ${hour}:__ — minutes?`,
-    { parse_mode: "HTML", reply_markup: minutePicker(mode, taskId, date, hour) },
+    {
+      parse_mode: "HTML",
+      reply_markup: minutePicker(mode, taskId, date, hour, boundsFor(mode, task)),
+    },
   );
 });
 
@@ -302,15 +374,100 @@ bot.callbackQuery(/^cancel:(\d+)$/, async (ctx) => {
 
 // ── Remove flow ────────────────────────────────────────────────────────────
 
-bot.callbackQuery(/^rm:(\d+)$/, async (ctx) => {
-  const removed = removeTask(ctx.from.id, Number(ctx.match[1]));
+bot.callbackQuery("rmenu:t", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText("Which one is done?", {
+    reply_markup: taskKeyboard(listTasks(ctx.from.id), "rm"),
+  });
+});
 
-  if (!removed) {
+bot.callbackQuery("rmenu:r", async (ctx) => {
+  const reminders = listReminders(ctx.from.id);
+  await ctx.answerCallbackQuery();
+  if (reminders.length === 0) {
+    await ctx.editMessageText("No reminders pending.");
+    return;
+  }
+  await ctx.editMessageText("Which reminder should I drop?", {
+    reply_markup: reminderKeyboard(reminders),
+  });
+});
+
+/** Deleting a task takes its reminders with it, so say so before doing it. */
+bot.callbackQuery(/^rm:(\d+)$/, async (ctx) => {
+  const taskId = Number(ctx.match[1]);
+  const task = getTask(ctx.from.id, taskId);
+
+  if (!task) {
     await ctx.answerCallbackQuery("Already gone.");
     // The message's buttons are stale — drop them so nothing else can be tapped.
     await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
     return;
   }
+
+  const pending = taskReminders(ctx.from.id, taskId);
+  if (pending.length === 0) {
+    await deleteTaskNow(ctx, taskId);
+    return;
+  }
+
+  const plural = pending.length === 1 ? "reminder" : "reminders";
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(
+    [
+      `⚠️ <b>${esc(task.text)}</b> has ${pending.length} ${plural}:`,
+      ...pending.map((r) => `    🔔 ${formatDeadline(r.remind_at)}`),
+      "",
+      `Deleting the task cancels ${pending.length === 1 ? "it" : "them"} too.`,
+    ].join("\n"),
+    {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard()
+        .text("Delete anyway", `rmyes:${taskId}`)
+        .text("Keep it", "rmno"),
+    },
+  );
+});
+
+bot.callbackQuery(/^rmyes:(\d+)$/, async (ctx) => {
+  await deleteTaskNow(ctx, Number(ctx.match[1]));
+});
+
+bot.callbackQuery("rmno", async (ctx) => {
+  await ctx.answerCallbackQuery("Kept");
+  await ctx.editMessageText("Nothing removed.").catch(() => {});
+});
+
+bot.callbackQuery(/^rmr:(\d+)$/, async (ctx) => {
+  const removed = removeReminder(ctx.from.id, Number(ctx.match[1]));
+
+  if (!removed) {
+    await ctx.answerCallbackQuery("Already gone.");
+    await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
+    return;
+  }
+
+  await ctx.answerCallbackQuery("Reminder dropped");
+
+  const remaining = listReminders(ctx.from.id);
+  const header = `✅ Dropped the ${formatDeadline(removed.remind_at)} reminder`;
+
+  if (remaining.length === 0) {
+    await ctx.editMessageText(`${header}\n\nNo reminders left.`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  await ctx.editMessageText(`${header}\n\nAnything else?`, {
+    parse_mode: "HTML",
+    reply_markup: reminderKeyboard(remaining),
+  });
+});
+
+async function deleteTaskNow(ctx: PickerCtx, taskId: number): Promise<void> {
+  const removed = removeTask(ctx.from.id, taskId);
+  if (!removed) return expired(ctx);
 
   await ctx.answerCallbackQuery("Removed");
 
@@ -328,7 +485,7 @@ bot.callbackQuery(/^rm:(\d+)$/, async (ctx) => {
     parse_mode: "HTML",
     reply_markup: taskKeyboard(remaining, "rm"),
   });
-});
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -397,6 +554,17 @@ function commitWhen(
 
   const task = getTask(userId, taskId);
   if (!task) return { ok: false, text: "That task no longer exists." };
+
+  // The keyboard already hides these, but a typed time or a forged callback
+  // could still land here, so the rule is enforced where it actually counts.
+  const bounds = boundsFor("r", task);
+  if (bounds.max && when > bounds.max && task.deadline) {
+    return {
+      ok: false,
+      text: `That's after the deadline (${formatDeadline(task.deadline)}). Pick an earlier time.`,
+    };
+  }
+
   if (!addReminder(userId, taskId, when)) {
     return { ok: false, text: "That task no longer exists." };
   }

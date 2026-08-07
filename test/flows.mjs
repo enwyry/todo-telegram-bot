@@ -285,24 +285,125 @@ console.log("\nreminder delivery");
   pass("fires once, then is retired");
 }
 
-console.log("\n/remove");
-await send("/remove");
+console.log("\nreminder bounded by the deadline");
 {
-  const b = buttons().find((x) => x.data === `rm:${taskId}`);
-  assert.ok(b.label.includes("14:30"), `remove button lacks date/time: "${b.label}"`);
-  pass("remove buttons carry date + time");
+  // The task's deadline is `${date} 14:30`.
+  await tap(`cal:r:${taskId}:${date.slice(0, 7)}`);
+  const days = buttons()
+    .filter((b) => b.data?.startsWith("day:r:"))
+    .map((b) => b.data.split(":")[3]);
+  assert.ok(days.length > 0, "no selectable days at all");
+  assert.ok(days.every((d) => d <= date), `offered a day past the deadline: ${days}`);
+  assert.ok(days.includes(date), "the deadline day itself should be selectable");
+  pass("calendar stops at the deadline day");
+
+  await tap(`day:r:${taskId}:${date}`);
+  const hours = buttons().filter((b) => b.data?.startsWith("hr:r:")).map((b) => b.label);
+  assert.equal(hours.at(-1), "14:00", `hours should stop at 14:00, got ${hours.at(-1)}`);
+  assert.ok(!hours.includes("15:00"), "offered an hour past the deadline");
+  pass("hours stop at the deadline hour");
+
+  await tap(`hr:r:${taskId}:${date}:14`);
+  const mins = buttons().filter((b) => b.data?.startsWith("min:r:")).map((b) => b.label);
+  assert.equal(mins.at(-1), "30", `minutes should stop at 30, got ${mins.at(-1)}`);
+  pass("minutes stop at the deadline minute");
+
+  await tap(`type:r:${taskId}:${date}`);
+  await send("23:59");
+  assert.match(last("sendMessage").payload.text, /after the deadline/i);
+  assert.equal(db.listReminders(USER).length, 1, "over-deadline reminder was stored");
+  pass("typed time past the deadline is refused");
+}
+
+console.log("\n/remove — task or reminder");
+{
+  db.addReminder(USER, taskId, `${date} 10:00`); // now two pending
+  await send("/remove");
+  const opts = buttons();
+  assert.ok(opts.some((b) => b.data === "rmenu:t"), "no task option");
+  assert.ok(opts.some((b) => b.data === "rmenu:r"), "no reminder option");
+  pass("offers a choice when reminders exist");
+}
+
+await tap("rmenu:r");
+let reminderId;
+{
+  const rows = buttons().filter((b) => b.data?.startsWith("rmr:"));
+  assert.equal(rows.length, 2, "both reminders should be listed");
+  const ten = rows.find((b) => b.label.includes("10:00"));
+  assert.ok(ten, `reminder buttons lack date/time: ${rows.map((r) => r.label)}`);
+  assert.ok(ten.label.includes("buy milk"), "reminder button should name its task");
+  reminderId = Number(ten.data.split(":")[1]);
+  pass("reminder buttons carry date, time and task");
+}
+
+await tap(`rmr:${reminderId}`);
+{
+  assert.equal(db.listReminders(USER).length, 1, "reminder not dropped");
+  assert.ok(db.getTask(USER, taskId), "dropping a reminder must not delete the task");
+  pass("drops the reminder, keeps the task");
+}
+
+console.log("\nwarning before deleting a task with reminders");
+await send("/remove");
+await tap("rmenu:t");
+await tap(`rm:${taskId}`);
+{
+  const text = last("editMessageText").payload.text;
+  assert.match(text, /⚠️/, "no warning shown");
+  assert.match(text, /1 reminder/, "warning should count the reminders");
+  assert.match(text, /09:00/, "warning should show when they fire");
+  assert.ok(db.getTask(USER, taskId), "task must NOT be deleted before confirming");
+  assert.ok(buttons().some((b) => b.data === `rmyes:${taskId}`), "no confirm button");
+  pass("warns and waits instead of deleting");
+}
+
+await tap("rmno");
+{
+  assert.ok(db.getTask(USER, taskId), "declining must keep the task");
+  assert.equal(db.listReminders(USER).length, 1, "declining must keep the reminders");
+  pass("'Keep it' cancels the deletion");
 }
 
 await tap(`rm:${taskId}`);
+await tap(`rmyes:${taskId}`);
 {
-  assert.equal(db.getTask(USER, taskId), null, "task not deleted");
+  assert.equal(db.getTask(USER, taskId), null, "task not deleted after confirming");
   assert.equal(db.listReminders(USER).length, 0, "reminders should cascade-delete");
-  pass("task removed, reminders cascade");
+  pass("confirming deletes the task and its reminders");
 }
 
 await tap(`rm:${taskId}`);
 assert.match(last("answerCallbackQuery").payload.text, /gone/i);
 pass("stale button is handled, not crashed");
+
+console.log("\noverdue task");
+{
+  await send("/add already late");
+  const id = Number(buttons().find((b) => b.data?.startsWith("day:d:")).data.split(":")[2]);
+  db.setDeadline(USER, id, "2020-01-01 09:00");
+
+  await send("/reminder");
+  await tap(`rem:${id}`);
+  const text = last("editMessageText").payload.text;
+  assert.match(text, /has passed/i, `expected an explanation, got: ${text}`);
+  assert.equal(buttons().length, 0, "should not show a dead calendar");
+  assert.equal(db.listReminders(USER).length, 0, "nothing should be scheduled");
+  db.removeTask(USER, id);
+  pass("explains instead of showing an empty calendar");
+}
+
+console.log("\nno reminders → no menu");
+{
+  await send("/add solo");
+  const id = Number(buttons().find((b) => b.data?.startsWith("day:d:")).data.split(":")[2]);
+  await send("/remove");
+  assert.ok(buttons().some((b) => b.data === `rm:${id}`), "should skip straight to tasks");
+  assert.ok(!buttons().some((b) => b.data === "rmenu:r"), "should not offer an empty menu");
+  await tap(`rm:${id}`);
+  assert.equal(db.getTask(USER, id), null, "undated task with no reminders deletes at once");
+  pass("skips the menu and the warning when there's nothing to lose");
+}
 
 console.log("\nHTML escaping");
 await send("/add <b>&pwn</b>");

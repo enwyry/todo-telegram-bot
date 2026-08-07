@@ -95,6 +95,8 @@ export type Reminder = {
   task_id: number;
   remind_at: string;
   sent_at: string | null;
+  /** Text of the task this reminder belongs to, for labelling buttons. */
+  text: string;
 };
 
 /** A due reminder joined with the task it belongs to, ready to send. */
@@ -103,11 +105,22 @@ export type DueReminder = Reminder & { user_id: number; text: string };
 const insertReminder = db.prepare(
   `INSERT INTO reminders (task_id, user_id, remind_at)
    SELECT ?, user_id, ? FROM tasks WHERE id = ? AND user_id = ?
-   RETURNING id, task_id, remind_at, sent_at`,
+   RETURNING id, task_id, remind_at, sent_at, '' AS text`,
 );
 const selectReminders = db.prepare(
-  `SELECT id, task_id, remind_at, sent_at FROM reminders
-   WHERE user_id = ? AND sent_at IS NULL ORDER BY remind_at`,
+  `SELECT r.id, r.task_id, r.remind_at, r.sent_at, t.text
+   FROM reminders r JOIN tasks t ON t.id = r.task_id
+   WHERE r.user_id = ? AND r.sent_at IS NULL ORDER BY r.remind_at`,
+);
+const selectTaskReminders = db.prepare(
+  `SELECT r.id, r.task_id, r.remind_at, r.sent_at, t.text
+   FROM reminders r JOIN tasks t ON t.id = r.task_id
+   WHERE r.user_id = ? AND r.task_id = ? AND r.sent_at IS NULL
+   ORDER BY r.remind_at`,
+);
+const deleteReminder = db.prepare(
+  `DELETE FROM reminders WHERE user_id = ? AND id = ?
+   RETURNING id, task_id, remind_at, sent_at, '' AS text`,
 );
 const selectDue = db.prepare(
   `SELECT r.id, r.task_id, r.remind_at, r.sent_at, r.user_id, t.text
@@ -132,9 +145,19 @@ export function addReminder(
   );
 }
 
-/** Pending (unsent) reminders for a user. */
+/** Pending (unsent) reminders for a user, soonest first. */
 export function listReminders(userId: number): Reminder[] {
   return selectReminders.all(userId) as unknown as Reminder[];
+}
+
+/** Pending reminders attached to one task — used to warn before deleting it. */
+export function taskReminders(userId: number, taskId: number): Reminder[] {
+  return selectTaskReminders.all(userId, taskId) as unknown as Reminder[];
+}
+
+/** Returns the deleted reminder, or null if it isn't the user's. */
+export function removeReminder(userId: number, id: number): Reminder | null {
+  return (deleteReminder.get(userId, id) as Reminder | undefined) ?? null;
 }
 
 /** `now` is local wall time as "YYYY-MM-DD HH:MM" — the same shape we store. */

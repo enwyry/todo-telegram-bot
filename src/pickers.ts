@@ -3,6 +3,69 @@ import { InlineKeyboard } from "grammy";
 /** Which flow the picker is driving: a task deadline, or a reminder time. */
 export type Mode = "d" | "r";
 
+/**
+ * Selectable window, as "YYYY-MM-DD HH:MM" strings. Reminders are bounded below
+ * by now and above by the task's deadline, so nothing pointless is offered.
+ */
+export type Bounds = { min?: string | null; max?: string | null };
+
+function partsOf(value: string | null | undefined) {
+  if (!value) return null;
+  const [date, time] = value.split(" ");
+  return { date: date ?? "", time: time ?? null };
+}
+
+/** Hours that fall inside the bounds on the given date. */
+function allowedHours(date: string, bounds: Bounds): number[] {
+  const min = partsOf(bounds.min);
+  const max = partsOf(bounds.max);
+  const hours: number[] = [];
+
+  for (let hour = 0; hour < 24; hour++) {
+    if (max && date === max.date && max.time && hour > Number(max.time.slice(0, 2))) {
+      continue;
+    }
+    if (min && date === min.date && min.time && hour < Number(min.time.slice(0, 2))) {
+      continue;
+    }
+    hours.push(hour);
+  }
+  return hours;
+}
+
+/** Minutes that fall inside the bounds at the given date and hour. */
+function allowedMinutes(date: string, hour: string, bounds: Bounds): number[] {
+  const min = partsOf(bounds.min);
+  const max = partsOf(bounds.max);
+  const minutes: number[] = [];
+
+  for (let minute = 0; minute < 60; minute++) {
+    if (
+      max && date === max.date && max.time &&
+      hour === max.time.slice(0, 2) && minute > Number(max.time.slice(3, 5))
+    ) {
+      continue;
+    }
+    if (
+      min && date === min.date && min.time &&
+      hour === min.time.slice(0, 2) && minute < Number(min.time.slice(3, 5))
+    ) {
+      continue;
+    }
+    minutes.push(minute);
+  }
+  return minutes;
+}
+
+/** True when this date has at least one selectable time — used to grey out days. */
+export function dateIsSelectable(date: string, bounds: Bounds): boolean {
+  const min = partsOf(bounds.min);
+  const max = partsOf(bounds.max);
+  if (min && date < min.date) return false;
+  if (max && date > max.date) return false;
+  return allowedHours(date, bounds).length > 0;
+}
+
 const MONTHS = [
   "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December",
@@ -41,6 +104,7 @@ export function datePicker(
   mode: Mode,
   taskId: number,
   cursor: string,
+  bounds: Bounds = {},
 ): InlineKeyboard {
   const [yearStr, monthStr] = cursor.split("-");
   const year = Number(yearStr);
@@ -69,11 +133,13 @@ export function datePicker(
 
   for (let day = 1; day <= daysInMonth; day++) {
     const date = new Date(year, month, day);
-    const isPast = date < today;
+    const iso = ymd(date);
+    // Out of range: before today, or past the deadline we're bounded by.
+    const off = date < today || !dateIsSelectable(iso, bounds);
     const isToday = date.getTime() === today.getTime();
     cells.push({
-      label: isToday ? `·${day}·` : isPast ? "·" : String(day),
-      data: isPast ? "noop" : `day:${mode}:${taskId}:${ymd(date)}`,
+      label: off ? "·" : isToday ? `·${day}·` : String(day),
+      data: off ? "noop" : `day:${mode}:${taskId}:${iso}`,
     });
   }
   while (cells.length % 7 !== 0) cells.push({ label: " ", data: "noop" });
@@ -83,13 +149,21 @@ export function datePicker(
     if ((i + 1) % 7 === 0) keyboard.row();
   });
 
+  // Shortcuts, but only while they still point somewhere selectable.
   const today0 = startOfToday();
   const tomorrow = new Date(today0);
   tomorrow.setDate(tomorrow.getDate() + 1);
-  keyboard
-    .text("Today", `day:${mode}:${taskId}:${ymd(today0)}`)
-    .text("Tomorrow", `day:${mode}:${taskId}:${ymd(tomorrow)}`)
-    .row();
+  const shortcuts: [string, Date][] = [
+    ["Today", today0],
+    ["Tomorrow", tomorrow],
+  ];
+  let added = false;
+  for (const [label, date] of shortcuts) {
+    if (!dateIsSelectable(ymd(date), bounds)) continue;
+    keyboard.text(label, `day:${mode}:${taskId}:${ymd(date)}`);
+    added = true;
+  }
+  if (added) keyboard.row();
 
   // A reminder is pointless without a time, so it gets no skip/all-day escape.
   keyboard.text(
@@ -100,37 +174,44 @@ export function datePicker(
   return keyboard;
 }
 
-/** Hours 00–23, four per row. Deadlines may also be all-day. */
+/**
+ * Selectable hours, four per row. Out-of-range hours are left out entirely
+ * rather than shown greyed — fewer buttons is the whole point.
+ */
 export function hourPicker(
   mode: Mode,
   taskId: number,
   date: string,
+  bounds: Bounds = {},
 ): InlineKeyboard {
   const keyboard = new InlineKeyboard();
-  for (let hour = 0; hour < 24; hour++) {
+  allowedHours(date, bounds).forEach((hour, i) => {
     keyboard.text(`${pad(hour)}:00`, `hr:${mode}:${taskId}:${date}:${pad(hour)}`);
-    if ((hour + 1) % 4 === 0) keyboard.row();
-  }
+    if ((i + 1) % 4 === 0) keyboard.row();
+  });
+  keyboard.row();
   keyboard.text("⌨️ Type a time", `type:${mode}:${taskId}:${date}`).row();
   if (mode === "d") keyboard.text("All day", `allday:${taskId}:${date}`);
   return keyboard.text("‹ Back", `cal:${mode}:${taskId}:${date.slice(0, 7)}`);
 }
 
-/** Every minute 00–59, ten per row, so any exact time is one tap away. */
+/** Selectable minutes, ten per row, so any exact time is one tap away. */
 export function minutePicker(
   mode: Mode,
   taskId: number,
   date: string,
   hour: string,
+  bounds: Bounds = {},
 ): InlineKeyboard {
   const keyboard = new InlineKeyboard();
-  for (let minute = 0; minute < 60; minute++) {
+  allowedMinutes(date, hour, bounds).forEach((minute, i) => {
     keyboard.text(
       pad(minute),
       `min:${mode}:${taskId}:${date}:${hour}:${pad(minute)}`,
     );
-    if ((minute + 1) % 10 === 0) keyboard.row();
-  }
+    if ((i + 1) % 10 === 0) keyboard.row();
+  });
+  keyboard.row();
   return keyboard
     .text("⌨️ Type a time", `type:${mode}:${taskId}:${date}`)
     .text("‹ Back", `day:${mode}:${taskId}:${date}`);
