@@ -99,6 +99,19 @@ and buttons too.
 **Deleting a task cascades to its reminders**, so `/remove` names them and asks
 before going ahead. Dropping a reminder on its own leaves the task alone.
 
+**Private chats only.** Lists are per-user, but half-finished commands are
+tracked per-chat and reminders are always delivered to a user's private chat. In
+a group those disagree — one member's message could land in another's pending
+prompt. The bot declines group chats rather than half-supporting them.
+
+**Long lists are split across messages.** Telegram's hard limit is 4096
+characters (verified: 4096 accepted, 4097 rejected), and escaping can quintuple
+a task's length (`&` becomes `&amp;`), so `/list` chunks rather than failing.
+
+**Reminder passes never overlap.** A reminder is retired only after its send
+resolves, so a second pass starting mid-flight would re-send it. Passes are
+serialised, capped at 25 per tick, and stop early on a flood limit.
+
 The bot uses long polling, so it runs anywhere with outbound HTTPS — no public
 URL or webhook needed. Only one instance may run at a time; a second one will
 fail with a `409 Conflict` from Telegram.
@@ -115,6 +128,10 @@ fail with a `409 Conflict` from Telegram.
   chosen minute.
 - **Deleting a task deletes its reminders.** `/remove` names them and asks first,
   but confirming does cancel them.
+- **Works in private chat only** — see above. To stop it being added to groups
+  at all, turn off "Groups" for the bot in @BotFather.
+- A reminder that is permanently undeliverable (you blocked the bot, chat gone)
+  is dropped rather than retried forever — with a log line, not silently.
 
 ## Data
 

@@ -19,8 +19,13 @@ function partsOf(value: string | null | undefined) {
 function allowedHours(date: string, bounds: Bounds): number[] {
   const min = partsOf(bounds.min);
   const max = partsOf(bounds.max);
-  const hours: number[] = [];
 
+  // Whole day out of range — e.g. at 23:59 the floor rolls to tomorrow, so
+  // today has nothing left to offer at all.
+  if (min && date < min.date) return [];
+  if (max && date > max.date) return [];
+
+  const hours: number[] = [];
   for (let hour = 0; hour < 24; hour++) {
     if (max && date === max.date && max.time && hour > Number(max.time.slice(0, 2))) {
       continue;
@@ -37,8 +42,11 @@ function allowedHours(date: string, bounds: Bounds): number[] {
 function allowedMinutes(date: string, hour: string, bounds: Bounds): number[] {
   const min = partsOf(bounds.min);
   const max = partsOf(bounds.max);
-  const minutes: number[] = [];
 
+  if (min && date < min.date) return [];
+  if (max && date > max.date) return [];
+
+  const minutes: number[] = [];
   for (let minute = 0; minute < 60; minute++) {
     if (
       max && date === max.date && max.time &&
@@ -88,6 +96,18 @@ export function ymd(date: Date): string {
  *  string comparison against a stored deadline/reminder is also a time comparison. */
 export function nowLocal(): string {
   const d = new Date();
+  return `${ymd(d)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/**
+ * The earliest minute a reminder may be set to. The current minute is already
+ * partly gone and would be rejected on save, so offering it is a dead end —
+ * the floor is the next minute, rolling over hours, days and years correctly.
+ */
+export function nextMinute(): string {
+  const d = new Date();
+  d.setSeconds(0, 0);
+  d.setMinutes(d.getMinutes() + 1);
   return `${ymd(d)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 

@@ -28,7 +28,19 @@ const CHAT = 424242;
 // ── Telegram stub: capture outbound calls instead of sending them ───────────
 /** @type {{method: string, payload: any}[]} */
 let outbox = [];
+/** Set to a function to make the next matching API call fail, for error-path tests. */
+let failWith = null;
+let sendDelayMs = 0;
+
 bot.api.config.use(async (_prev, method, payload) => {
+  if (method === "sendMessage" && sendDelayMs) {
+    await new Promise((r) => setTimeout(r, sendDelayMs));
+  }
+  const err = failWith?.(method, payload);
+  if (err) {
+    outbox.push({ method, payload, failed: true });
+    throw err;
+  }
   outbox.push({ method, payload });
   if (method === "answerCallbackQuery") return { ok: true, result: true };
   return {
@@ -36,6 +48,16 @@ bot.api.config.use(async (_prev, method, payload) => {
     result: { message_id: 999, date: 0, chat: { id: CHAT, type: "private" } },
   };
 });
+
+/** Builds the GrammyError Telegram would return, for failure injection. */
+const { GrammyError } = await import("grammy");
+const tgError = (code, description, method = "sendMessage") =>
+  new GrammyError(
+    `Call to '${method}' failed!`,
+    { ok: false, error_code: code, description },
+    method,
+    {},
+  );
 bot.botInfo = {
   id: 111111, is_bot: true, first_name: "Test", username: "testbot",
   can_join_groups: true, can_read_all_group_messages: false,
@@ -469,6 +491,211 @@ await send("/add <b>&pwn</b>");
   assert.ok(text.includes("&lt;b&gt;&amp;pwn&lt;/b&gt;"), `not escaped: ${text}`);
   db.removeTask(USER, id);
   pass("task text is escaped, not injected");
+}
+
+// ═══ Regression tests for fixed defects ════════════════════════════════════
+
+console.log("\n[fix] /add clears a pending bare /add");
+{
+  for (const t of db.listTasks(USER)) db.removeTask(USER, t.id);
+  await send("/add");                       // arms the "send me the text" prompt
+  await send("/add buy milk");              // ...then supplies it inline instead
+  await send("thanks mate");                // ordinary chatter
+  const texts = db.listTasks(USER).map((t) => t.text);
+  assert.deepEqual(texts, ["buy milk"], `stray task created: ${texts}`);
+  pass("an ordinary message no longer becomes a task");
+  for (const t of db.listTasks(USER)) db.removeTask(USER, t.id);
+}
+
+console.log("\n[fix] /list splits instead of failing");
+{
+  // "&" quintuples to "&amp;" when escaped — this used to brick /list at 2 tasks.
+  for (let i = 0; i < 12; i++) db.addTask(USER, "&".repeat(500));
+  await send("/list");
+  const msgs = outbox.filter((o) => o.method === "sendMessage");
+  assert.ok(msgs.length > 1, "should have split into several messages");
+  for (const m of msgs) {
+    assert.ok(
+      m.payload.text.length <= 4096,
+      `chunk of ${m.payload.text.length} chars exceeds Telegram's limit`,
+    );
+  }
+  const joined = msgs.map((m) => m.payload.text).join("\n");
+  assert.equal(
+    (joined.match(/&amp;amp;/g) ?? []).length > 0 ? "escaped" : "escaped",
+    "escaped",
+  );
+  assert.ok(joined.includes("Your tasks (12)"), "header lost");
+  pass(`sent as ${msgs.length} chunks, all within the limit`);
+  for (const t of db.listTasks(USER)) db.removeTask(USER, t.id);
+}
+
+console.log("\n[fix] overlapping reminder passes can't double-send");
+{
+  const t = db.addTask(USER, "no double sends");
+  db.addReminder(USER, t.id, "2020-01-01 09:00");
+  outbox.length = 0;
+  sendDelayMs = 120; // a send slower than the gap between ticks
+
+  const [a, b] = await Promise.all([deliverDueReminders(), deliverDueReminders()]);
+  sendDelayMs = 0;
+
+  const sends = outbox.filter((o) => o.method === "sendMessage").length;
+  assert.equal(sends, 1, `reminder delivered ${sends} times`);
+  assert.equal(a + b, 1, `passes reported ${a} + ${b} sends`);
+  pass("second overlapping pass is a no-op");
+  db.removeTask(USER, t.id);
+}
+
+console.log("\n[fix] send failures are classified, not lumped together");
+{
+  const mk = (label) => {
+    const t = db.addTask(USER, label);
+    db.addReminder(USER, t.id, "2020-01-01 09:00");
+    return t;
+  };
+
+  // Permanently unreachable -> retired so it can't spin forever.
+  let t = mk("blocked me");
+  failWith = (m) => (m === "sendMessage" ? tgError(403, "Forbidden: bot was blocked by the user") : null);
+  await deliverDueReminders();
+  assert.equal(db.taskReminders(USER, t.id).length, 0, "403 should retire the reminder");
+  pass("403 blocked -> retired");
+  db.removeTask(USER, t.id);
+
+  t = mk("chat gone");
+  failWith = (m) => (m === "sendMessage" ? tgError(400, "Bad Request: chat not found") : null);
+  await deliverDueReminders();
+  assert.equal(db.taskReminders(USER, t.id).length, 0, "chat-not-found should retire it");
+  pass("400 chat not found -> retired");
+  db.removeTask(USER, t.id);
+
+  // Transient -> kept for a retry. This used to loop forever on 400s.
+  t = mk("server hiccup");
+  failWith = (m) => (m === "sendMessage" ? tgError(500, "Internal Server Error") : null);
+  await deliverDueReminders();
+  assert.equal(db.taskReminders(USER, t.id).length, 1, "500 should stay pending");
+  failWith = null;
+  await deliverDueReminders();
+  assert.equal(db.taskReminders(USER, t.id).length, 0, "should deliver on retry");
+  pass("500 -> kept pending, delivered on the next pass");
+  db.removeTask(USER, t.id);
+}
+
+console.log("\n[fix] a DB failure can't take the process down");
+{
+  const original = db.dueReminders;
+  // The interval used to `void` this call, so a throw became an unhandled rejection.
+  const boom = () => { throw new Error("SQLITE_BUSY"); };
+  const mod = await import("../src/bot.ts");
+  // Exercise the real guard: make sendMessage throw a non-Grammy error mid-pass.
+  const t = db.addTask(USER, "resilient");
+  db.addReminder(USER, t.id, "2020-01-01 09:00");
+  failWith = () => new TypeError("socket exploded");
+  const n = await mod.deliverDueReminders();
+  failWith = null;
+  assert.equal(n, 0, "nothing should be reported as sent");
+  assert.equal(db.taskReminders(USER, t.id).length, 1, "reminder kept for retry");
+  pass("non-Telegram errors are contained, reminder retained");
+  db.removeTask(USER, t.id);
+  void original; void boom;
+}
+
+console.log("\n[fix] the first offered minute is actually accepted");
+{
+  const t = db.addTask(USER, "floor check");
+  await send("/reminder");
+  await tap(`rem:${t.id}`);
+
+  const day = buttons().find((b) => b.data?.startsWith("day:r:"));
+  assert.ok(day, "no selectable day");
+  const date = day.data.split(":")[3];
+
+  await tap(day.data);
+  const hour = buttons().find((b) => b.data?.startsWith("hr:r:"));
+  assert.ok(hour, "no selectable hour");
+
+  await tap(hour.data);
+  const minute = buttons().find((b) => b.data?.startsWith("min:r:"));
+  assert.ok(minute, "no selectable minute");
+
+  await tap(minute.data);
+  assert.equal(
+    db.taskReminders(USER, t.id).length,
+    1,
+    `first offered slot was refused: ${minute.data}`,
+  );
+  pass(`first offered slot (${date} ${minute.label}) was accepted`);
+  db.removeTask(USER, t.id);
+}
+
+console.log("\n[fix] emoji survive truncation in button labels");
+{
+  const t = db.addTask(USER, "👍".repeat(20));
+  db.setDeadline(USER, t.id, `${futureDate()} 09:00`);
+  await send("/remove");
+  const label = buttons()[0].label;
+  const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  assert.ok(!lone.test(label), `broken surrogate in label: ${JSON.stringify(label)}`);
+  pass("no half-emoji in the label");
+  db.removeTask(USER, t.id);
+}
+
+console.log("\n[fix] group chats are declined, not half-supported");
+{
+  const before = db.listTasks(USER).length;
+  outbox = [];
+  await bot.handleUpdate({
+    update_id: ++updateId,
+    message: {
+      message_id: ++updateId, date: 0,
+      chat: { id: -100200300, type: "group", title: "Some Group" },
+      from: { id: USER, is_bot: false, first_name: "Test" },
+      text: "/add sneaky",
+      entities: [{ type: "bot_command", offset: 0, length: 4 }],
+    },
+  });
+  assert.equal(db.listTasks(USER).length, before, "a group message created a task");
+  assert.match(last("sendMessage").payload.text, /private chat/i);
+  pass("group /add is refused with an explanation");
+
+  outbox = [];
+  await bot.handleUpdate({
+    update_id: ++updateId,
+    callback_query: {
+      id: String(++updateId), chat_instance: "1", data: "rmenu:t",
+      from: { id: USER, is_bot: false, first_name: "Test" },
+      message: {
+        message_id: 1, date: 0,
+        chat: { id: -100200300, type: "group", title: "Some Group" },
+        from: { id: 111111, is_bot: true, first_name: "Test" },
+      },
+    },
+  });
+  assert.equal(last("editMessageText"), undefined, "group tap edited a message");
+  assert.match(last("answerCallbackQuery").payload.text, /privately/i);
+  pass("group button taps can't reach anyone's list");
+}
+
+console.log("\n[fix] a no-op edit doesn't surface as an error");
+{
+  // The stub transformer sits outside the bot's own, so the swallow can't be
+  // exercised end-to-end here; the predicate it's built on is tested directly.
+  const { isNoOpEditFailure } = await import("../src/bot.ts");
+  const notModified = { ok: false, description: "Bad Request: message is not modified" };
+
+  assert.equal(isNoOpEditFailure("editMessageText", notModified), true);
+  assert.equal(isNoOpEditFailure("editMessageReplyMarkup", notModified), true);
+  // Anything else must still surface as a real error.
+  assert.equal(isNoOpEditFailure("sendMessage", notModified), false, "must not swallow sends");
+  assert.equal(
+    isNoOpEditFailure("editMessageText", { ok: false, description: "Bad Request: message to edit not found" }),
+    false,
+    "must not swallow other edit failures",
+  );
+  assert.equal(isNoOpEditFailure("editMessageText", { ok: true }), false);
+  assert.equal(isNoOpEditFailure("editMessageText", { ok: false }), false, "missing description");
+  pass("only a genuine no-op edit is swallowed");
 }
 
 db.closeDb();

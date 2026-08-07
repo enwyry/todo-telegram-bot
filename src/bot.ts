@@ -21,6 +21,7 @@ import {
   hourPicker,
   isOverdue,
   minutePicker,
+  nextMinute,
   nowLocal,
   parseTime,
   ymd,
@@ -51,6 +52,59 @@ const awaitingTime = new Map<
 
 export const bot = new Bot(token);
 
+/**
+ * Double-tapping a button that re-renders the same view (month navigation, the
+ * remove menu) asks Telegram to replace a message with what it already says,
+ * which it rejects with 400 "message is not modified". The tap is a no-op by
+ * definition, so it's swallowed here — once, centrally, rather than at each of
+ * the ~20 edit call sites where one would inevitably be missed.
+ */
+export function isNoOpEditFailure(
+  method: string,
+  res: { ok: boolean; description?: string },
+): boolean {
+  if (res.ok) return false;
+  if (method !== "editMessageText" && method !== "editMessageReplyMarkup") {
+    return false;
+  }
+  return /message is not modified/i.test(res.description ?? "");
+}
+
+bot.api.config.use(async (prev, method, payload, signal) => {
+  // grammY turns an `ok: false` response into a GrammyError *after* the
+  // transformer stack, so this has to inspect the response — a try/catch here
+  // would never fire.
+  const res = await prev(method, payload, signal);
+  if (isNoOpEditFailure(method, res)) {
+    return { ok: true, result: true } as typeof res;
+  }
+  return res;
+});
+
+/**
+ * Private chats only.
+ *
+ * Lists are per-user but the half-finished-command state above is per-chat, and
+ * reminders are always delivered to a user's private chat. In a group those
+ * disagree: one member's message can land in another's pending prompt, and a
+ * reminder for a group-created task goes somewhere the group can't see. Rather
+ * than half-support that, the bot says so and stays out.
+ */
+bot.use(async (ctx, next) => {
+  if (ctx.chat && ctx.chat.type !== "private") {
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery({
+        text: "Message me privately to use this bot.",
+        show_alert: true,
+      });
+    } else if (ctx.message?.text?.startsWith("/")) {
+      await ctx.reply("I only work in a private chat — message me directly.");
+    }
+    return;
+  }
+  await next();
+});
+
 /** A new command abandons any half-finished /add or typed-time prompt. */
 function resetPending(chatId: number): void {
   awaitingTaskText.delete(chatId);
@@ -62,8 +116,12 @@ function esc(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/** Truncates by grapheme, so an emoji is never cut into a broken half-character. */
 function truncate(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+  const parts = [...graphemes.segment(text)].map((s) => s.segment);
+  return parts.length <= max ? text : `${parts.slice(0, max - 1).join("")}…`;
 }
 
 /** Button label — always carries the date/time so tasks are identifiable at a glance. */
@@ -79,6 +137,41 @@ function describe(task: Task): string {
   return isOverdue(task.deadline)
     ? `${esc(task.text)} — <b>${when}</b> ⚠️`
     : `${esc(task.text)} — <b>${when}</b>`;
+}
+
+/** Telegram rejects anything longer than this (verified: 4096 ok, 4097 not). */
+const TELEGRAM_TEXT_LIMIT = 4096;
+
+/**
+ * Sends `lines` as however many messages it takes. A single 500-character task
+ * can reach ~2500 characters once escaped (`&` becomes `&amp;`), so a long list
+ * would otherwise blow the limit and fail with no reply at all.
+ */
+async function replyInChunks(ctx: ReplyCtx, lines: string[]): Promise<void> {
+  const chunks: string[] = [];
+  let current = "";
+
+  for (const line of lines) {
+    // A line longer than a whole message can't be batched — cut it, taking care
+    // not to leave a half-written HTML entity behind.
+    const safe =
+      line.length > TELEGRAM_TEXT_LIMIT
+        ? `${line.slice(0, TELEGRAM_TEXT_LIMIT - 1).replace(/&[a-z]*$/i, "")}…`
+        : line;
+
+    const candidate = current ? `${current}\n${safe}` : safe;
+    if (candidate.length > TELEGRAM_TEXT_LIMIT) {
+      if (current) chunks.push(current);
+      current = safe;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(current);
+
+  for (const chunk of chunks) {
+    await ctx.reply(chunk, { parse_mode: "HTML" });
+  }
 }
 
 function taskKeyboard(tasks: Task[], prefix: "rm" | "rem"): InlineKeyboard {
@@ -110,15 +203,18 @@ function reminderKeyboard(reminders: Reminder[]): InlineKeyboard {
 function boundsFor(mode: Mode, task: Task): Bounds {
   if (mode === "d") return {};
 
-  const min = nowLocal();
+  // The floor is the next minute, not this one: the current minute is already
+  // partly spent and commitWhen would reject it, so offering it is a dead end.
+  const min = nextMinute();
   if (!task.deadline) return { min };
 
   // An all-day deadline still allows any time on that day.
   const max = task.deadline.includes(" ") ? task.deadline : `${task.deadline} 23:59`;
 
   // Already overdue: capping at the deadline would leave no slot at all, so the
-  // cap is dropped and you can still be reminded about a late task.
-  return max <= min ? { min } : { min, max };
+  // cap is dropped and you can still be reminded about a late task. `max < min`
+  // (not `<=`) keeps a deadline exactly one minute away usable.
+  return max < min ? { min } : { min, max };
 }
 
 // ── Commands ───────────────────────────────────────────────────────────────
@@ -142,7 +238,9 @@ bot.command("start", async (ctx) => {
 
 bot.command("add", async (ctx) => {
   const text = ctx.match.trim();
-  awaitingTime.delete(ctx.chat.id);
+  // Clear first: an earlier bare /add could still be waiting, and leaving it
+  // armed would turn the next ordinary message into a second task.
+  resetPending(ctx.chat.id);
   if (!text) {
     awaitingTaskText.add(ctx.chat.id);
     await ctx.reply("What's the task? Send it as your next message.");
@@ -179,15 +277,12 @@ bot.command("list", async (ctx) => {
 
   const overdue = tasks.filter((t) => t.deadline && isOverdue(t.deadline)).length;
 
-  await ctx.reply(
-    [
-      `<b>Your tasks (${tasks.length})</b>`,
-      "",
-      ...lines,
-      ...(overdue > 0 ? ["", `⚠️ ${overdue} overdue`] : []),
-    ].join("\n"),
-    { parse_mode: "HTML" },
-  );
+  await replyInChunks(ctx, [
+    `<b>Your tasks (${tasks.length})</b>`,
+    "",
+    ...lines,
+    ...(overdue > 0 ? ["", `⚠️ ${overdue} overdue`] : []),
+  ]);
 });
 
 bot.command("reminder", async (ctx) => {
@@ -631,28 +726,78 @@ async function saveTask(ctx: ReplyCtx, text: string): Promise<void> {
 
 // ── Reminder delivery ──────────────────────────────────────────────────────
 
-/** Sends anything now due. Reminders missed while the bot was down fire late, not never. */
-export async function deliverDueReminders(): Promise<number> {
-  const now = nowLocal();
-  let sent = 0;
+/** At most this many per pass, so an outage backlog is drained steadily. */
+const REMINDERS_PER_PASS = 25;
 
-  for (const r of dueReminders(now)) {
-    try {
-      await bot.api.sendMessage(
-        r.user_id,
-        `🔔 <b>Reminder</b>\n${esc(r.text)}`,
-        { parse_mode: "HTML" },
+/** Non-null while a pass is running, so ticks can't overlap and shutdown can wait. */
+let inFlight: Promise<unknown> | null = null;
+
+/**
+ * The chat is gone for good — retrying would spin forever. Anything else
+ * (network blips, 429 flood limits, 5xx) stays pending and is retried.
+ */
+function isUnreachable(err: unknown): string | null {
+  if (!(err instanceof GrammyError)) return null;
+  if (err.error_code === 403) return err.description; // blocked, kicked, deactivated
+  if (err.error_code === 400 && /chat not found/i.test(err.description)) {
+    return err.description;
+  }
+  return null;
+}
+
+/**
+ * Sends anything now due. Reminders missed while the bot was down fire late,
+ * not never. Concurrent calls are a no-op: a reminder is only retired *after*
+ * its send resolves, so an overlapping pass would re-select and re-send it.
+ */
+export function deliverDueReminders(): Promise<number> {
+  if (inFlight) return Promise.resolve(0);
+  // The flag is cleared by `finally` on the promise we hand back, so awaiting
+  // this call guarantees the next one is free to run. deliverOnce never
+  // rejects, so `run` can't become an unhandled rejection either.
+  const run = deliverOnce().finally(() => {
+    inFlight = null;
+  });
+  inFlight = run;
+  return run;
+}
+
+async function deliverOnce(): Promise<number> {
+  let sent = 0;
+  try {
+    const now = nowLocal();
+    const due = dueReminders(now);
+    const batch = due.slice(0, REMINDERS_PER_PASS);
+    if (due.length > batch.length) {
+      console.warn(
+        `${due.length} reminders due; sending ${batch.length} now, rest next pass.`,
       );
-      markSent(r.id, now);
-      sent++;
-    } catch (err) {
-      // 403 = user blocked the bot. Retrying forever would just spin, so retire it.
-      if (err instanceof GrammyError && err.error_code === 403) {
-        markSent(r.id, now);
-      } else {
-        console.error(`Failed to send reminder ${r.id}:`, err);
+    }
+
+    for (const r of batch) {
+      try {
+        await bot.api.sendMessage(r.user_id, `🔔 <b>Reminder</b>\n${esc(r.text)}`, {
+          parse_mode: "HTML",
+        });
+        markSent(r.id, nowLocal());
+        sent++;
+      } catch (err) {
+        const unreachable = isUnreachable(err);
+        if (unreachable) {
+          // Retired rather than retried — but never silently.
+          console.warn(`Dropping reminder ${r.id}: ${unreachable}`);
+          markSent(r.id, nowLocal());
+          continue;
+        }
+        console.error(`Failed to send reminder ${r.id}, will retry:`, err);
+        // Flood limit: stop the pass rather than hammering into a deeper one.
+        if (err instanceof GrammyError && err.error_code === 429) break;
       }
     }
+  } catch (err) {
+    // A DB failure here would otherwise escape the interval as an unhandled
+    // rejection and take the process down.
+    console.error("Reminder pass failed:", err);
   }
   return sent;
 }
@@ -680,13 +825,27 @@ if (!process.env.BOT_TEST_MODE) {
   }
 
   const timer = setInterval(() => {
-    void deliverDueReminders();
+    deliverDueReminders().catch((err) => {
+      console.error("Reminder tick failed:", err);
+    });
   }, REMINDER_POLL_MS);
 
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.once(signal, () => {
       clearInterval(timer);
-      void bot.stop().then(closeDb);
+      // Let an in-flight pass finish first. Closing the database under it would
+      // finalize the statements mid-send, so a reminder that was actually
+      // delivered would never be marked sent and would fire again on restart.
+      void (async () => {
+        try {
+          if (inFlight) await inFlight;
+          await bot.stop();
+        } catch (err) {
+          console.error("Error during shutdown:", err);
+        } finally {
+          closeDb();
+        }
+      })();
     });
   }
 
