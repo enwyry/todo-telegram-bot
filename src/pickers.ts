@@ -137,8 +137,11 @@ export function datePicker(
     // Out of range: before today, or past the deadline we're bounded by.
     const off = date < today || !dateIsSelectable(iso, bounds);
     const isToday = date.getTime() === today.getTime();
+    // Today is bracketed so it stands out even on a month you've navigated to,
+    // and even when it isn't selectable.
+    const label = off ? "·" : String(day);
     cells.push({
-      label: off ? "·" : isToday ? `·${day}·` : String(day),
+      label: isToday ? `[${label}]` : label,
       data: off ? "noop" : `day:${mode}:${taskId}:${iso}`,
     });
   }
@@ -246,14 +249,26 @@ export function parseTime(input: string): string | null {
   return `${pad(hour)}:${pad(minute)}`;
 }
 
-/** "Fri 8 Aug, 14:30" — or "Fri 8 Aug" for an all-day task. */
+/**
+ * "Fri 8 Aug, 14:30", or "Fri 8 Aug" when there's no time.
+ * Today and tomorrow are named instead of dated, so the current day stands out
+ * in every list and button without having to read the date.
+ */
 export function formatDeadline(deadline: string): string {
   const [datePart, timePart] = deadline.split(" ");
   const [year, month, day] = (datePart ?? "").split("-").map(Number);
   const date = new Date(year ?? 0, (month ?? 1) - 1, day ?? 1);
 
-  const label =
-    `${SHORT_DAYS[date.getDay()] ?? ""} ${date.getDate()} ${SHORT_MONTHS[date.getMonth()] ?? ""}`;
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+
+  let label: string;
+  if (datePart === ymd(new Date())) label = "Today";
+  else if (datePart === ymd(tomorrow)) label = "Tomorrow";
+  else {
+    label = `${SHORT_DAYS[date.getDay()] ?? ""} ${date.getDate()} ${SHORT_MONTHS[date.getMonth()] ?? ""}`;
+  }
+
   return timePart ? `${label}, ${timePart}` : label;
 }
 

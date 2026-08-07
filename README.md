@@ -88,6 +88,14 @@ that are out of range, so the choice is only ever between valid options. The
 rule is re-checked in `commitWhen()` before writing, because a typed time or a
 forged callback never touches the keyboard.
 
+The exception is an **overdue** task: capping at a deadline that has already
+passed would leave no slot at all, so the cap is dropped and you can still be
+reminded about something late.
+
+**Today is bracketed** (`[7]`) in every calendar, and `formatDeadline` says
+"Today" / "Tomorrow" instead of a date, so the current day is obvious in lists
+and buttons too.
+
 **Deleting a task cascades to its reminders**, so `/remove` names them and asks
 before going ahead. Dropping a reminder on its own leaves the task alone.
 
@@ -105,10 +113,8 @@ fail with a `409 Conflict` from Telegram.
   stay due until delivered. Restarting after a long outage sends a burst.
 - Reminder polling is 30s, so delivery can land up to 30 seconds after the
   chosen minute.
-- **An overdue task can't take a reminder at all** — every slot before its
-  deadline is in the past. `/reminder` says so rather than showing a dead
-  calendar, but it does mean "remind me tomorrow about this late thing" is not
-  currently expressible.
+- **Deleting a task deletes its reminders.** `/remove` names them and asks first,
+  but confirming does cancel them.
 
 ## Data
 

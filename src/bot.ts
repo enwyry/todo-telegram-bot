@@ -109,11 +109,16 @@ function reminderKeyboard(reminders: Reminder[]): InlineKeyboard {
  */
 function boundsFor(mode: Mode, task: Task): Bounds {
   if (mode === "d") return {};
-  if (!task.deadline) return { min: nowLocal() };
-  return {
-    min: nowLocal(),
-    max: task.deadline.includes(" ") ? task.deadline : `${task.deadline} 23:59`,
-  };
+
+  const min = nowLocal();
+  if (!task.deadline) return { min };
+
+  // An all-day deadline still allows any time on that day.
+  const max = task.deadline.includes(" ") ? task.deadline : `${task.deadline} 23:59`;
+
+  // Already overdue: capping at the deadline would leave no slot at all, so the
+  // cap is dropped and you can still be reminded about a late task.
+  return max <= min ? { min } : { min, max };
 }
 
 // ── Commands ───────────────────────────────────────────────────────────────
@@ -241,20 +246,6 @@ bot.callbackQuery(/^rem:(\d+)$/, async (ctx) => {
   const taskId = Number(ctx.match[1]);
   const task = getTask(ctx.from.id, taskId);
   if (!task) return expired(ctx);
-
-  // Reminders can't be scheduled past the deadline, so an overdue task has no
-  // valid slot at all. Say that outright rather than showing a dead calendar.
-  const window = boundsFor("r", task);
-  if (window.max && window.max <= nowLocal() && task.deadline) {
-    await ctx.answerCallbackQuery();
-    await ctx.editMessageText(
-      `<b>${esc(task.text)}</b> was due ${formatDeadline(task.deadline)}, which has passed — ` +
-        `there's no time left to remind you before it.\n\n` +
-        `Give it a new deadline with /add, or clear it with /remove.`,
-      { parse_mode: "HTML" },
-    );
-    return;
-  }
 
   await ctx.answerCallbackQuery();
   await ctx.editMessageText(`When should I remind you about <b>${esc(task.text)}</b>?`, {

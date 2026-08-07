@@ -20,7 +20,7 @@ process.env.BOT_TOKEN ??= "111111:TEST-TOKEN-NOT-USED-NETWORK-IS-STUBBED";
 
 const { bot, deliverDueReminders } = await import("../src/bot.ts");
 const db = await import("../src/db.ts");
-const { ymd, parseTime } = await import("../src/pickers.ts");
+const { ymd, parseTime, formatDeadline } = await import("../src/pickers.ts");
 
 const USER = 424242;
 const CHAT = 424242;
@@ -377,7 +377,7 @@ await tap(`rm:${taskId}`);
 assert.match(last("answerCallbackQuery").payload.text, /gone/i);
 pass("stale button is handled, not crashed");
 
-console.log("\noverdue task");
+console.log("\noverdue task can still be reminded about");
 {
   await send("/add already late");
   const id = Number(buttons().find((b) => b.data?.startsWith("day:d:")).data.split(":")[2]);
@@ -385,12 +385,67 @@ console.log("\noverdue task");
 
   await send("/reminder");
   await tap(`rem:${id}`);
-  const text = last("editMessageText").payload.text;
-  assert.match(text, /has passed/i, `expected an explanation, got: ${text}`);
-  assert.equal(buttons().length, 0, "should not show a dead calendar");
-  assert.equal(db.listReminders(USER).length, 0, "nothing should be scheduled");
+  assert.ok(
+    buttons().some((b) => b.data?.startsWith("day:r:")),
+    "an overdue task should still get a calendar",
+  );
+  pass("calendar is offered despite the passed deadline");
+
+  const soon = futureDate();
+  await tap(`day:r:${id}:${soon}`);
+  const hours = buttons().filter((b) => b.data?.startsWith("hr:r:"));
+  assert.equal(hours.length, 24, "a passed deadline should impose no upper bound");
+  pass("no upper bound once the deadline is behind us");
+
+  await tap(`min:r:${id}:${soon}:09:00`);
+  assert.equal(
+    db.taskReminders(USER, id).length,
+    1,
+    "reminder after a passed deadline should be allowed",
+  );
+  pass("reminder saved past the passed deadline");
   db.removeTask(USER, id);
-  pass("explains instead of showing an empty calendar");
+}
+
+console.log("\ntoday is highlighted");
+{
+  await send("/add highlight check");
+  const id = Number(buttons().find((b) => b.data?.startsWith("day:d:")).data.split(":")[2]);
+  const todayIso = ymd(new Date());
+
+  const todayCell = buttons().find((b) => b.data === `day:d:${id}:${todayIso}`);
+  assert.ok(todayCell, "today should be selectable as a deadline");
+  assert.match(todayCell.label, /^\[.+\]$/, `today not marked: "${todayCell.label}"`);
+
+  const plain = buttons().filter(
+    (b) => b.data?.startsWith("day:d:") && b.data !== `day:d:${id}:${todayIso}`,
+  );
+  assert.ok(plain.length > 0 && plain.every((b) => !b.label.startsWith("[")),
+    "only today should be marked");
+  pass("today is bracketed in the deadline calendar");
+
+  db.setDeadline(USER, id, `${futureDate()} 12:00`);
+  await send("/reminder");
+  await tap(`rem:${id}`);
+  const rCell = buttons().find((b) => b.data === `day:r:${id}:${todayIso}`);
+  assert.ok(rCell, "today should be selectable for a reminder");
+  assert.match(rCell.label, /^\[.+\]$/, `today not marked in reminder calendar: "${rCell.label}"`);
+  pass("today is bracketed in the reminder calendar too");
+  db.removeTask(USER, id);
+}
+
+console.log("\nrelative day labels");
+{
+  const todayIso = ymd(new Date());
+  const tm = new Date();
+  tm.setDate(tm.getDate() + 1);
+
+  assert.equal(formatDeadline(`${todayIso} 14:30`), "Today, 14:30");
+  assert.equal(formatDeadline(todayIso), "Today");
+  assert.equal(formatDeadline(`${ymd(tm)} 09:00`), "Tomorrow, 09:00");
+  // Anything further out keeps its date.
+  assert.match(formatDeadline("2027-12-25 08:00"), /^\w{3} 25 Dec, 08:00$/);
+  pass("today and tomorrow are named, other dates keep their date");
 }
 
 console.log("\nno reminders → no menu");
