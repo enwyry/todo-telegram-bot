@@ -20,7 +20,7 @@ process.env.BOT_TOKEN ??= "111111:TEST-TOKEN-NOT-USED-NETWORK-IS-STUBBED";
 
 const { bot, deliverDueReminders } = await import("../src/bot.ts");
 const db = await import("../src/db.ts");
-const { ymd } = await import("../src/pickers.ts");
+const { ymd, parseTime } = await import("../src/pickers.ts");
 
 const USER = 424242;
 const CHAT = 424242;
@@ -136,15 +136,64 @@ await tap(`day:d:${taskId}:${date}`);
 await tap(`hr:d:${taskId}:${date}:14`);
 {
   const mins = buttons().filter((b) => b.data?.startsWith("min:d:"));
-  assert.deepEqual(mins.map((m) => m.label), ["14:00", "14:15", "14:30", "14:45"]);
-  pass("minute picker: quarter hours");
+  assert.equal(mins.length, 60, `expected every minute, got ${mins.length}`);
+  assert.deepEqual(mins.map((m) => m.label).slice(0, 3), ["00", "01", "02"]);
+  assert.equal(mins.at(-1).label, "59");
+  assert.ok(buttons().some((b) => b.data === `type:d:${taskId}:${date}`), "no type option");
+  pass("minute picker: all 60 minutes + type option");
 }
 
-await tap(`min:d:${taskId}:${date}:14:30`);
+await tap(`min:d:${taskId}:${date}:14:37`);
 {
-  assert.equal(db.getTask(USER, taskId).deadline, `${date} 14:30`);
+  assert.equal(db.getTask(USER, taskId).deadline, `${date} 14:37`);
   assert.match(last("editMessageText").payload.text, /Added/);
-  pass("deadline persisted as picked");
+  pass("exact minute (14:37) persisted");
+}
+
+console.log("\ntyped time");
+{
+  await tap(`type:d:${taskId}:${date}`);
+  assert.match(last("editMessageText").payload.text, /send me the time/i);
+
+  await send("not a time");
+  assert.match(last("sendMessage").payload.text, /couldn't read/i);
+  assert.equal(db.getTask(USER, taskId).deadline, `${date} 14:37`, "should be unchanged");
+  pass("garbage input is rejected, state kept");
+
+  await send("2:30pm");
+  assert.equal(db.getTask(USER, taskId).deadline, `${date} 14:30`);
+  pass("typed '2:30pm' → 14:30");
+
+  await tap(`type:d:${taskId}:${date}`);
+  await send("09:07");
+  assert.equal(db.getTask(USER, taskId).deadline, `${date} 09:07`);
+  pass("typed '09:07' → 09:07");
+
+  // A command must abandon the typing prompt rather than eat the next message.
+  await tap(`type:d:${taskId}:${date}`);
+  await send("/list");
+  await send("23:59");
+  assert.equal(db.getTask(USER, taskId).deadline, `${date} 09:07`, "stale prompt consumed a message");
+  pass("a command cancels the typing prompt");
+
+  db.setDeadline(USER, taskId, `${date} 14:30`); // restore for later assertions
+}
+
+console.log("\nparseTime");
+{
+  for (const [input, want] of [
+    ["14:37", "14:37"], ["14.37", "14.37".replace(".", ":")], ["1437", "14:37"],
+    ["9:05", "09:05"], ["9", "09:00"], ["09", "09:00"], ["0:00", "00:00"],
+    ["23:59", "23:59"], [" 14:37 ", "14:37"], ["2:30pm", "14:30"],
+    ["2:30 PM", "14:30"], ["12:00am", "00:00"], ["12:00pm", "12:00"],
+    ["11pm", "23:00"],
+  ]) {
+    assert.equal(parseTime(input), want, `parseTime(${JSON.stringify(input)})`);
+  }
+  for (const bad of ["", "abc", "24:00", "12:60", "25:10", "-1:00", "13pm", "0pm", ":30", "1:2"]) {
+    assert.equal(parseTime(bad), null, `parseTime(${JSON.stringify(bad)}) should be null`);
+  }
+  pass("14 valid formats parsed, 10 invalid rejected");
 }
 
 console.log("\n/list");
@@ -203,6 +252,16 @@ await tap(`min:r:${taskId}:2020-01-01:09:00`);
 }
 
 {
+  // Same guard, but reached by typing rather than tapping a minute button.
+  const before = db.listReminders(USER).length;
+  await tap(`type:r:${taskId}:2020-01-01`);
+  await send("09:00");
+  assert.match(last("sendMessage").payload.text, /passed/i);
+  assert.equal(db.listReminders(USER).length, before, "typed past reminder was stored");
+  pass("refuses a typed reminder in the past");
+}
+
+{
   // A second user must not be able to touch this task by guessing its id.
   assert.equal(db.getTask(999, taskId), null);
   assert.equal(db.setDeadline(999, taskId, "2030-01-01"), null);
@@ -215,6 +274,7 @@ await tap(`min:r:${taskId}:2020-01-01:09:00`);
 console.log("\nreminder delivery");
 {
   db.addReminder(USER, taskId, "2020-01-01 09:00"); // already due
+  outbox.length = 0; // only look at what delivery itself sends
   const sent = await deliverDueReminders();
   assert.equal(sent, 1, "due reminder not delivered");
   const msg = outbox.find((o) => o.method === "sendMessage");

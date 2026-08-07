@@ -11,8 +11,9 @@ Every user gets their own private list.
 | `/reminder` | Pick a task, pick a date and time — the bot messages you when it's due  |
 | `/remove`   | Pick a task from a button list to delete it                             |
 
-Dates and times are always **chosen from buttons** — a month calendar, then an
-hour, then minutes. Nothing is typed by hand, so nothing can be mistyped.
+Pick dates and times **from buttons** — a month calendar, then an hour, then any
+of the 60 minutes. Or tap **⌨️ Type a time** and write `14:37` / `2:30pm` if
+that's quicker.
 
 ```
 /add buy milk
@@ -26,10 +27,14 @@ Mo Tu We Th Fr Sa Su
 [Skip deadline]
    ↓  tap 8
 00:00 01:00 02:00 03:00  ← tap an hour, or "All day"
+...
+[⌨️ Type a time]
    ↓  tap 14:00
-14:00 14:15 14:30 14:45  ← tap the minutes
+00 01 02 03 04 05 06 07 08 09   ← any minute, one tap
+10 11 12 13 14 15 16 17 18 19
+...                     37 ...
    ↓
-✅ Added buy milk — Sat 8 Aug, 14:30
+✅ Added buy milk — Sat 8 Aug, 14:37
 ```
 
 ## Setup
@@ -89,10 +94,10 @@ fail with a `409 Conflict` from Telegram.
   timezone setting before sharing it more widely.
 - **Reminders missed while the bot is down are sent late, not skipped** — they
   stay due until delivered. Restarting after a long outage sends a burst.
-- **Minutes are quarter-hours** (`:00 :15 :30 :45`). Finer granularity would mean
-  a lot more buttons.
 - Reminder polling is 30s, so delivery can land up to 30 seconds after the
   chosen minute.
+- **Deleting a task deletes its reminders.** That's the intended cascade, but it
+  means a `/remove` silently cancels anything pending for that task.
 
 ## Data
 

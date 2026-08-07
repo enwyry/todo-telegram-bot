@@ -20,6 +20,7 @@ import {
   isOverdue,
   minutePicker,
   nowLocal,
+  parseTime,
   ymd,
   type Mode,
 } from "./pickers.ts";
@@ -38,7 +39,20 @@ const REMINDER_POLL_MS = 30_000;
 /** Chats that sent a bare /add and are expected to reply with the task text. */
 const awaitingTaskText = new Set<number>();
 
+/** Chats that tapped "Type a time" and owe us an HH:MM. Losing this on restart
+ *  costs nothing — the date is still chosen, they just tap the button again. */
+const awaitingTime = new Map<
+  number,
+  { mode: Mode; taskId: number; date: string }
+>();
+
 export const bot = new Bot(token);
+
+/** A new command abandons any half-finished /add or typed-time prompt. */
+function resetPending(chatId: number): void {
+  awaitingTaskText.delete(chatId);
+  awaitingTime.delete(chatId);
+}
 
 /** Telegram's HTML parse mode only needs these three escaped. */
 function esc(text: string): string {
@@ -75,7 +89,7 @@ function taskKeyboard(tasks: Task[], prefix: "rm" | "rem"): InlineKeyboard {
 // ── Commands ───────────────────────────────────────────────────────────────
 
 bot.command("start", async (ctx) => {
-  awaitingTaskText.delete(ctx.chat.id);
+  resetPending(ctx.chat.id);
   await ctx.reply(
     [
       "👋 <b>Hi! I keep your todo list.</b>",
@@ -93,6 +107,7 @@ bot.command("start", async (ctx) => {
 
 bot.command("add", async (ctx) => {
   const text = ctx.match.trim();
+  awaitingTime.delete(ctx.chat.id);
   if (!text) {
     awaitingTaskText.add(ctx.chat.id);
     await ctx.reply("What's the task? Send it as your next message.");
@@ -102,7 +117,7 @@ bot.command("add", async (ctx) => {
 });
 
 bot.command("list", async (ctx) => {
-  awaitingTaskText.delete(ctx.chat.id);
+  resetPending(ctx.chat.id);
   const userId = ctx.from?.id;
   if (!userId) return;
 
@@ -141,7 +156,7 @@ bot.command("list", async (ctx) => {
 });
 
 bot.command("reminder", async (ctx) => {
-  awaitingTaskText.delete(ctx.chat.id);
+  resetPending(ctx.chat.id);
   const userId = ctx.from?.id;
   if (!userId) return;
 
@@ -159,7 +174,7 @@ bot.command("reminder", async (ctx) => {
 });
 
 bot.command("remove", async (ctx) => {
-  awaitingTaskText.delete(ctx.chat.id);
+  resetPending(ctx.chat.id);
   const userId = ctx.from?.id;
   if (!userId) return;
 
@@ -241,29 +256,36 @@ bot.callbackQuery(
     const taskId = Number(ctx.match[2]);
     const when = `${ctx.match[3]} ${ctx.match[4]}:${ctx.match[5]}`;
 
-    if (mode === "d") return finishDeadline(ctx, taskId, when);
+    if (!getTask(ctx.from.id, taskId)) return expired(ctx);
 
-    // A reminder in the past would fire the moment it's saved.
-    if (when <= nowLocal()) {
-      await ctx.answerCallbackQuery({
-        text: "That time has already passed — pick a later one.",
-        show_alert: true,
-      });
+    const result = commitWhen(mode, ctx.from.id, taskId, when);
+    if (!result.ok) {
+      await ctx.answerCallbackQuery({ text: result.text, show_alert: true });
       return;
     }
 
-    const task = getTask(ctx.from.id, taskId);
-    if (!task) return expired(ctx);
-    const reminder = addReminder(ctx.from.id, taskId, when);
-    if (!reminder) return expired(ctx);
-
-    await ctx.answerCallbackQuery("Reminder set");
-    await ctx.editMessageText(
-      `🔔 I'll remind you about <b>${esc(task.text)}</b> on <b>${formatDeadline(when)}</b>.`,
-      { parse_mode: "HTML" },
-    );
+    await ctx.answerCallbackQuery(mode === "d" ? "Date set" : "Reminder set");
+    await ctx.editMessageText(result.text, { parse_mode: "HTML" });
   },
 );
+
+/** "Type a time" — remember what we're timing, then wait for their next message. */
+bot.callbackQuery(/^type:([dr]):(\d+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
+  const mode = ctx.match[1] as Mode;
+  const taskId = Number(ctx.match[2]);
+  const date = ctx.match[3] ?? "";
+
+  const task = getTask(ctx.from.id, taskId);
+  if (!task) return expired(ctx);
+
+  awaitingTime.set(ctx.chat?.id ?? ctx.from.id, { mode, taskId, date });
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(
+    `<b>${esc(task.text)}</b>\n${formatDeadline(date)} — send me the time.\n\n` +
+      `<i>Like</i> <code>14:37</code><i>, </i><code>9:05</code><i>, or </i><code>2:30pm</code>`,
+    { parse_mode: "HTML" },
+  );
+});
 
 bot.callbackQuery(/^allday:(\d+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
   await finishDeadline(ctx, Number(ctx.match[1]), ctx.match[2] ?? "");
@@ -348,10 +370,72 @@ async function finishDeadline(
   );
 }
 
-// Follow-up to a bare /add.
+/**
+ * Writes a chosen "YYYY-MM-DD HH:MM" as either the task's deadline or a new
+ * reminder, and returns the message to show. Shared by the minute buttons and
+ * the typed-time path so both behave identically.
+ */
+function commitWhen(
+  mode: Mode,
+  userId: number,
+  taskId: number,
+  when: string,
+): { ok: true; text: string } | { ok: false; text: string } {
+  if (mode === "d") {
+    const task = setDeadline(userId, taskId, when);
+    if (!task) return { ok: false, text: "That task no longer exists." };
+    return {
+      ok: true,
+      text: `✅ Added ${describe(task)}\n\n<i>Want a nudge? /reminder</i>`,
+    };
+  }
+
+  // A reminder in the past would fire the moment it's saved.
+  if (when <= nowLocal()) {
+    return { ok: false, text: "That time has already passed — pick a later one." };
+  }
+
+  const task = getTask(userId, taskId);
+  if (!task) return { ok: false, text: "That task no longer exists." };
+  if (!addReminder(userId, taskId, when)) {
+    return { ok: false, text: "That task no longer exists." };
+  }
+
+  return {
+    ok: true,
+    text: `🔔 I'll remind you about <b>${esc(task.text)}</b> on <b>${formatDeadline(when)}</b>.`,
+  };
+}
+
+// Free-text follow-ups: a typed time, or the text for a bare /add.
 bot.on("message:text", async (ctx) => {
+  const userId = ctx.from?.id;
+  const pending = awaitingTime.get(ctx.chat.id);
+
+  if (pending && userId) {
+    const time = parseTime(ctx.message.text);
+    if (!time) {
+      // Stay in the typing state so they can just correct themselves.
+      await ctx.reply(
+        "I couldn't read that as a time. Try <code>14:37</code> or <code>2:30pm</code>.",
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    awaitingTime.delete(ctx.chat.id);
+    const result = commitWhen(
+      pending.mode,
+      userId,
+      pending.taskId,
+      `${pending.date} ${time}`,
+    );
+    await ctx.reply(result.text, { parse_mode: "HTML" });
+    return;
+  }
+
   if (!awaitingTaskText.has(ctx.chat.id)) return;
-  awaitingTaskText.delete(ctx.chat.id);
+  resetPending(ctx.chat.id);
   await saveTask(ctx, ctx.message.text.trim());
 });
 

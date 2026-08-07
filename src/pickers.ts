@@ -111,10 +111,12 @@ export function hourPicker(
     keyboard.text(`${pad(hour)}:00`, `hr:${mode}:${taskId}:${date}:${pad(hour)}`);
     if ((hour + 1) % 4 === 0) keyboard.row();
   }
+  keyboard.text("⌨️ Type a time", `type:${mode}:${taskId}:${date}`).row();
   if (mode === "d") keyboard.text("All day", `allday:${taskId}:${date}`);
   return keyboard.text("‹ Back", `cal:${mode}:${taskId}:${date.slice(0, 7)}`);
 }
 
+/** Every minute 00–59, ten per row, so any exact time is one tap away. */
 export function minutePicker(
   mode: Mode,
   taskId: number,
@@ -122,13 +124,45 @@ export function minutePicker(
   hour: string,
 ): InlineKeyboard {
   const keyboard = new InlineKeyboard();
-  for (const minute of ["00", "15", "30", "45"]) {
+  for (let minute = 0; minute < 60; minute++) {
     keyboard.text(
-      `${hour}:${minute}`,
-      `min:${mode}:${taskId}:${date}:${hour}:${minute}`,
+      pad(minute),
+      `min:${mode}:${taskId}:${date}:${hour}:${pad(minute)}`,
     );
+    if ((minute + 1) % 10 === 0) keyboard.row();
   }
-  return keyboard.row().text("‹ Back", `day:${mode}:${taskId}:${date}`);
+  return keyboard
+    .text("⌨️ Type a time", `type:${mode}:${taskId}:${date}`)
+    .text("‹ Back", `day:${mode}:${taskId}:${date}`);
+}
+
+/**
+ * Parses a typed time into "HH:MM". Accepts 14:37, 14.37, 1437, 9:05, 9 (→ 09:00),
+ * and 2:30pm / 2pm. Returns null if it isn't a real time.
+ */
+export function parseTime(input: string): string | null {
+  const raw = input.trim().toLowerCase().replace(/\s+/g, "");
+
+  const suffix = raw.endsWith("am") ? "am" : raw.endsWith("pm") ? "pm" : null;
+  const body = suffix ? raw.slice(0, -2) : raw;
+
+  const match =
+    /^(\d{1,2})[:.h]?(\d{2})$/.exec(body) ?? /^(\d{1,2})$/.exec(body);
+  if (!match) return null;
+
+  let hour = Number(match[1]);
+  const minute = match[2] === undefined ? 0 : Number(match[2]);
+
+  if (suffix) {
+    if (hour < 1 || hour > 12) return null;
+    if (suffix === "pm" && hour !== 12) hour += 12;
+    if (suffix === "am" && hour === 12) hour = 0;
+  }
+
+  if (!Number.isInteger(hour) || hour < 0 || hour > 23) return null;
+  if (!Number.isInteger(minute) || minute < 0 || minute > 59) return null;
+
+  return `${pad(hour)}:${pad(minute)}`;
 }
 
 /** "Fri 8 Aug, 14:30" — or "Fri 8 Aug" for an all-day task. */
