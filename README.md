@@ -15,6 +15,18 @@ Give a task a **time** and it gets two reminders automatically — **1 hour** an
 **30 minutes** beforehand. They behave like any other reminder: they show in
 `/list`, and `/remove` can drop either one on its own.
 
+Every task carries an **importance**: 🔵 low, 🟡 medium, 🔴 high. New tasks start
+🟡, and the three buttons sit on the confirmation so it's one tap to change —
+or nothing to do at all if medium is right.
+
+```
+✅ Added 🟡 dinner with mum — Tomorrow, 19:00
+🔔 18:00, 18:30
+Importance: 🟡 Medium
+
+[ 🔵 Low ]  [ 🟡 Medium ✓ ]  [ 🔴 High ]
+```
+
 Pick dates and times **from buttons** — a month calendar, then an hour, then any
 of the 60 minutes. Or tap **⌨️ Type a time** and write `14:37` / `2:30pm` if
 that's quicker.
@@ -131,6 +143,13 @@ long after SIGTERM. If the grace runs out the handle is simply left open: every
 write is already committed and WAL recovers on the next start, whereas closing
 early would finalize the statements mid-send and leave a reminder Telegram had
 already delivered marked unsent — so it would arrive twice.
+
+**Importance is stored as 1/2/3, not as a colour.** The numbers are ordered, so
+ranking is a plain comparison and a different palette is a display change rather
+than a migration. It deliberately does **not** reorder `/list` — deadlines drive
+the list, and a colour that pushed next week above this afternoon would hide the
+thing that's actually due. The dot appears on every list line and task button
+instead. Re-picking a deadline leaves it alone, and an older database gets 🟡.
 
 **The default reminders follow the deadline.** They're marked in the database as
 automatic, so re-picking a deadline moves them instead of leaving the old pair

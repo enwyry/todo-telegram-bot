@@ -6,6 +6,8 @@ export type Task = {
   created_at: string;
   /** "YYYY-MM-DD" for an all-day task, "YYYY-MM-DD HH:MM" when a time was picked, or null. */
   deadline: string | null;
+  /** 1 low, 2 medium, 3 high. Ordered so a plain comparison ranks them. */
+  priority: number;
 };
 
 const db = new DatabaseSync(process.env.DB_PATH ?? "./tasks.db");
@@ -40,6 +42,12 @@ if (!columns.some((c) => c.name === "deadline")) {
   db.exec(`ALTER TABLE tasks ADD COLUMN deadline TEXT`);
 }
 
+// Tasks that predate importance are medium, the same as a new one nobody has
+// touched — so the column reads the same whether it was defaulted or chosen.
+if (!columns.some((c) => c.name === "priority")) {
+  db.exec(`ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 2`);
+}
+
 // Reminders added automatically from a deadline are marked, so that re-picking
 // that deadline can replace them without disturbing any the user set by hand.
 const reminderColumns = db.prepare(`PRAGMA table_info(reminders)`).all() as unknown as {
@@ -63,7 +71,7 @@ db.exec(`
     ON reminders (task_id, remind_at) WHERE sent_at IS NULL;
 `);
 
-const FIELDS = `id, text, created_at, deadline`;
+const FIELDS = `id, text, created_at, deadline, priority`;
 
 const insertTask = db.prepare(
   `INSERT INTO tasks (user_id, text) VALUES (?, ?) RETURNING ${FIELDS}`,
@@ -83,6 +91,9 @@ const updateDeadline = db.prepare(
 );
 const selectTask = db.prepare(
   `SELECT ${FIELDS} FROM tasks WHERE user_id = ? AND id = ?`,
+);
+const updatePriority = db.prepare(
+  `UPDATE tasks SET priority = ? WHERE user_id = ? AND id = ? RETURNING ${FIELDS}`,
 );
 
 export function addTask(userId: number, text: string): Task {
@@ -109,6 +120,15 @@ export function setDeadline(
   deadline: string | null,
 ): Task | null {
   return (updateDeadline.get(deadline, userId, id) as Task | undefined) ?? null;
+}
+
+/** 1 low, 2 medium, 3 high. Returns null if the task isn't the user's. */
+export function setPriority(
+  userId: number,
+  id: number,
+  priority: number,
+): Task | null {
+  return (updatePriority.get(priority, userId, id) as Task | undefined) ?? null;
 }
 
 // ── Reminders ──────────────────────────────────────────────────────────────

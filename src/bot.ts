@@ -14,6 +14,7 @@ import {
   removeReminder,
   removeTask,
   setDeadline,
+  setPriority,
   taskReminders,
   type Reminder,
   type Task,
@@ -177,19 +178,85 @@ function truncate(text: string, max: number): string {
   return `${[...short].slice(0, ceiling - 1).join("")}…`;
 }
 
+/**
+ * How important a task is. The numbers are ordered so a plain comparison ranks
+ * them, and they're what's stored — the colours are only how it's shown.
+ */
+const PRIORITIES = [
+  { level: 1, dot: "🔵", name: "Low" },
+  { level: 2, dot: "🟡", name: "Medium" },
+  { level: 3, dot: "🔴", name: "High" },
+] as const;
+
+const DEFAULT_PRIORITY = 2;
+
+function priorityOf(task: Task) {
+  return (
+    PRIORITIES.find((p) => p.level === task.priority) ??
+    PRIORITIES.find((p) => p.level === DEFAULT_PRIORITY)!
+  );
+}
+
 /** Button label — always carries the date/time so tasks are identifiable at a glance. */
 function taskLabel(task: Task): string {
   const when = task.deadline ? formatDeadline(task.deadline) : "no date";
-  return `${truncate(task.text, 28)} · ${when}`;
+  return `${priorityOf(task).dot} ${truncate(task.text, 26)} · ${when}`;
 }
 
 /** List line — same idea, with an overdue flag. */
 function describe(task: Task): string {
-  if (!task.deadline) return `${esc(task.text)} — <i>no date</i>`;
+  const dot = priorityOf(task).dot;
+  if (!task.deadline) return `${dot} ${esc(task.text)} — <i>no date</i>`;
   const when = formatDeadline(task.deadline);
   return isOverdue(task.deadline)
-    ? `${esc(task.text)} — <b>${when}</b> ⚠️`
-    : `${esc(task.text)} — <b>${when}</b>`;
+    ? `${dot} ${esc(task.text)} — <b>${when}</b> ⚠️`
+    : `${dot} ${esc(task.text)} — <b>${when}</b>`;
+}
+
+/** The three importance buttons, with the current one marked. */
+function priorityKeyboard(task: Task): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  for (const p of PRIORITIES) {
+    const current = p.level === priorityOf(task).level;
+    keyboard.text(
+      current ? `${p.dot} ${p.name} ✓` : `${p.dot} ${p.name}`,
+      `prio:${task.id}:${p.level}`,
+    );
+  }
+  return keyboard;
+}
+
+/**
+ * The reminders on a task, times only when they fall on the deadline's own day
+ * — "13:00, 13:30" reads better than the date three times over.
+ */
+function describeReminders(task: Task, reminders: Reminder[]): string {
+  const day = task.deadline?.slice(0, 10);
+  const shown = reminders
+    .slice(0, 3)
+    .map((r) =>
+      r.remind_at.slice(0, 10) === day
+        ? r.remind_at.slice(11)
+        : formatDeadline(r.remind_at),
+    );
+  const rest = reminders.length - shown.length;
+  return `🔔 ${shown.join(", ")}${rest > 0 ? ` and ${rest} more` : ""}`;
+}
+
+/**
+ * The "task is saved" message. Rendered wholly from the task as it stands, not
+ * from whatever just happened, so tapping an importance button re-renders the
+ * same message with one line changed rather than dropping the reminder line and
+ * appearing to lose them.
+ */
+function savedMessage(userId: number, task: Task): string {
+  const p = priorityOf(task);
+  const pending = taskReminders(userId, task.id);
+  return [
+    `✅ Added ${describe(task)}`,
+    ...(pending.length > 0 ? [describeReminders(task, pending)] : []),
+    `Importance: ${p.dot} <b>${p.name}</b>`,
+  ].join("\n");
 }
 
 /** Telegram rejects anything longer than this (verified: 4096 ok, 4097 not). */
@@ -329,6 +396,9 @@ bot.command("start", async (ctx) => {
       "<b>/list</b> — see everything, soonest first",
       "<b>/reminder</b> — get pinged about a task",
       "<b>/remove</b> — remove a task, or one of its reminders",
+      "",
+      "Every task carries an importance — 🔵 low, 🟡 medium, 🔴 high. New ones "
+        + "start 🟡; tap to change it when you add one.",
       "",
       "Give a task a time and I'll nudge you <b>1 hour</b> and <b>30 minutes</b> "
         + "beforehand, automatically. Drop either with <b>/remove</b>.",
@@ -530,7 +600,10 @@ bot.callbackQuery(
     }
 
     await ctx.answerCallbackQuery(mode === "d" ? "Date set" : "Reminder set");
-    await ctx.editMessageText(result.text, { parse_mode: "HTML" });
+    await ctx.editMessageText(result.text, {
+      parse_mode: "HTML",
+      reply_markup: result.keyboard,
+    });
   },
 );
 
@@ -558,6 +631,26 @@ bot.callbackQuery(/^allday:(\d+):(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
 
 bot.callbackQuery(/^skip:(\d+)$/, async (ctx) => {
   await finishDeadline(ctx, Number(ctx.match[1]), null);
+});
+
+/**
+ * Importance. The buttons stay on the message afterwards, so it can be changed
+ * as many times as you like — tapping the one already chosen is a no-op that
+ * Telegram rejects as "not modified", which the api guard already swallows.
+ */
+bot.callbackQuery(/^prio:(\d+):([123])$/, async (ctx) => {
+  const taskId = Number(ctx.match[1]);
+  const level = Number(ctx.match[2]);
+
+  const task = setPriority(ctx.from.id, taskId, level);
+  if (!task) return expired(ctx);
+
+  const p = priorityOf(task);
+  await ctx.answerCallbackQuery(`${p.dot} ${p.name}`);
+  await ctx.editMessageText(savedMessage(ctx.from.id, task), {
+    parse_mode: "HTML",
+    reply_markup: priorityKeyboard(task),
+  });
 });
 
 bot.callbackQuery(/^cancel:(\d+)$/, async (ctx) => {
@@ -731,10 +824,10 @@ async function finishDeadline(
   applyDefaultReminders(ctx.from.id, task);
 
   await ctx.answerCallbackQuery(deadline ? "Date set" : "Saved");
-  await ctx.editMessageText(
-    `✅ Added ${describe(task)}\n\n<i>Want a nudge? /reminder</i>`,
-    { parse_mode: "HTML" },
-  );
+  await ctx.editMessageText(savedMessage(ctx.from.id, task), {
+    parse_mode: "HTML",
+    reply_markup: priorityKeyboard(task),
+  });
 }
 
 /**
@@ -748,7 +841,7 @@ async function finishDeadline(
  * for the first.
  */
 type Commit =
-  | { ok: true; text: string }
+  | { ok: true; text: string; keyboard?: InlineKeyboard }
   | { ok: false; text: string; retry: boolean };
 
 const gone = { ok: false, text: "That task no longer exists.", retry: false } as const;
@@ -781,6 +874,9 @@ function applyDefaultReminders(userId: number, task: Task): Reminder[] {
   for (const offset of DEFAULT_REMINDER_OFFSETS) {
     const when = shiftMinutes(task.deadline, -offset);
     if (when <= floor) continue;
+    // Belt and braces rather than load-bearing: the unique index would reject
+    // this anyway and addReminder would hand back the existing row unharmed.
+    // Skipping early just avoids provoking a constraint error to find that out.
     if (pendingReminderAt(userId, task.id, when)) continue;
 
     const reminder = addReminder(userId, task.id, when, true);
@@ -788,13 +884,6 @@ function applyDefaultReminders(userId: number, task: Task): Reminder[] {
   }
 
   return added;
-}
-
-/** "🔔 I'll nudge you 1 hour and 30 minutes before." */
-function describeDefaults(added: Reminder[]): string {
-  if (added.length === 0) return "";
-  const times = added.map((r) => formatDeadline(r.remind_at).replace(/^.*, /, ""));
-  return `\n🔔 Nudges set for ${times.join(" and ")}.`;
 }
 
 function commitWhen(
@@ -806,12 +895,11 @@ function commitWhen(
   if (mode === "d") {
     const task = setDeadline(userId, taskId, when);
     if (!task) return gone;
-    const added = applyDefaultReminders(userId, task);
+    applyDefaultReminders(userId, task);
     return {
       ok: true,
-      text:
-        `✅ Added ${describe(task)}${describeDefaults(added)}\n\n` +
-        `<i>Want another? /reminder</i>`,
+      text: savedMessage(userId, task),
+      keyboard: priorityKeyboard(task),
     };
   }
 
@@ -894,7 +982,10 @@ bot.on("message:text", async (ctx) => {
     // silence. A task that no longer exists is not retryable, so that one lets
     // go rather than looping.
     if (result.ok || !result.retry) awaitingTime.delete(ctx.chat.id);
-    await ctx.reply(result.text, { parse_mode: "HTML" });
+    await ctx.reply(result.text, {
+      parse_mode: "HTML",
+      reply_markup: result.ok ? result.keyboard : undefined,
+    });
     return;
   }
 

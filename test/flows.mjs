@@ -919,6 +919,111 @@ console.log("\n[fix2] a refused typed time still listens for the correction");
   db.removeTask(USER, t3.id);
 }
 
+console.log("\nimportance: 🔵 low, 🟡 medium, 🔴 high");
+{
+  for (const t of db.listTasks(USER)) db.removeTask(USER, t.id);
+
+  await send("/add dinner with mum");
+  const id = Number(buttons().find((b) => b.data?.startsWith("day:d:")).data.split(":")[2]);
+  const d = futureDate();
+  await tap(`min:d:${id}:${d}:19:00`);
+
+  // Medium unless told otherwise, with the buttons right there on the receipt.
+  assert.equal(db.getTask(USER, id).priority, 2, "a new task should start medium");
+  const text = last("editMessageText").payload.text;
+  assert.match(text, /Importance: 🟡 <b>Medium<\/b>/, `no importance line: ${text}`);
+  const kb = buttons();
+  assert.deepEqual(
+    kb.map((b) => b.data),
+    [`prio:${id}:1`, `prio:${id}:2`, `prio:${id}:3`],
+    "the three importance buttons should be on the confirmation",
+  );
+  assert.ok(kb[1].label.endsWith("✓"), `the current level should be marked: ${kb[1].label}`);
+  pass("new tasks are 🟡 medium, with all three offered");
+
+  await tap(`prio:${id}:3`);
+  assert.equal(db.getTask(USER, id).priority, 3);
+  assert.match(last("editMessageText").payload.text, /Importance: 🔴 <b>High<\/b>/);
+  assert.ok(buttons()[2].label.endsWith("✓"), "the tick should follow the choice");
+  assert.match(last("answerCallbackQuery").payload.text, /High/);
+  pass("tapping 🔴 raises it and re-marks the buttons");
+
+  await tap(`prio:${id}:1`);
+  assert.equal(db.getTask(USER, id).priority, 1);
+  assert.match(last("editMessageText").payload.text, /Importance: 🔵 <b>Low<\/b>/);
+  pass("and it can be changed again, any number of times");
+
+  // Only the importance line moves — the reminders must not vanish on a re-render.
+  const after = last("editMessageText").payload.text;
+  assert.match(after, /🔔 18:00, 18:30/, `the reminder line was dropped: ${after}`);
+  assert.match(after, /dinner with mum/);
+  pass("the rest of the message is unchanged by a re-render");
+}
+
+console.log("\nimportance: shown everywhere a task is");
+{
+  const tasks = db.listTasks(USER);
+  const id = tasks[0].id;
+
+  await send("/list");
+  assert.match(last("sendMessage").payload.text, /🔵 dinner with mum/, "no dot in /list");
+  pass("the dot shows in /list");
+
+  await send("/reminder");
+  assert.ok(
+    buttons().find((b) => b.data === `rem:${id}`)?.label.startsWith("🔵"),
+    "no dot on the /reminder buttons",
+  );
+  pass("the dot shows on task buttons");
+
+  // An undated task gets one too, and defaults the same way.
+  await send("/add water the plants");
+  const id2 = Number(buttons().find((b) => b.data?.startsWith("day:d:")).data.split(":")[2]);
+  await tap(`skip:${id2}`);
+  assert.equal(db.getTask(USER, id2).priority, 2);
+  assert.match(last("editMessageText").payload.text, /🟡 water the plants — <i>no date<\/i>/);
+  assert.ok(buttons().some((b) => b.data === `prio:${id2}:3`), "no importance on an undated task");
+  pass("an undated task gets an importance too");
+}
+
+console.log("\nimportance: it sticks, and it's yours alone");
+{
+  const id = db.listTasks(USER).find((t) => t.text === "dinner with mum").id;
+  const d = futureDate();
+
+  // Re-picking the deadline must not quietly reset it to medium.
+  await tap(`min:d:${id}:${d}:20:00`);
+  assert.equal(db.getTask(USER, id).priority, 1, "changing the deadline reset the importance");
+  pass("it survives a deadline change");
+
+  // Ordering is by deadline, deliberately — importance doesn't reshuffle /list.
+  const order = db.listTasks(USER).map((t) => t.text);
+  assert.deepEqual(order, ["dinner with mum", "water the plants"],
+    "importance should not reorder the list");
+  pass("/list is still soonest-first, not importance-first");
+
+  // Another user can't reach it, same as every other write.
+  assert.equal(db.setPriority(999, id, 3), null, "cross-user write allowed");
+  assert.equal(db.getTask(USER, id).priority, 1, "task was mutated by another user");
+  pass("cross-user importance changes are blocked");
+
+  // A forged level outside 1-3 isn't routed at all.
+  outbox = [];
+  await tap(`prio:${id}:9`);
+  assert.equal(last("editMessageText"), undefined, "an out-of-range level was accepted");
+  assert.equal(db.getTask(USER, id).priority, 1);
+  pass("an out-of-range level is ignored");
+
+  // A stale button on a deleted task says so rather than throwing.
+  const doomed = db.addTask(USER, "gone");
+  db.removeTask(USER, doomed.id);
+  await tap(`prio:${doomed.id}:3`);
+  assert.match(last("answerCallbackQuery").payload.text, /gone/i);
+  pass("a stale importance button is handled");
+
+  for (const t of db.listTasks(USER)) db.removeTask(USER, t.id);
+}
+
 console.log("\ndefault reminders: 1 hour and 30 minutes before");
 {
   for (const t of db.listTasks(USER)) db.removeTask(USER, t.id);
@@ -930,7 +1035,7 @@ console.log("\ndefault reminders: 1 hour and 30 minutes before");
 
   const at = db.taskReminders(USER, id).map((r) => r.remind_at);
   assert.deepEqual(at, [`${d} 13:00`, `${d} 13:30`], `got ${JSON.stringify(at)}`);
-  assert.match(last("editMessageText").payload.text, /13:00 and 13:30/,
+  assert.match(last("editMessageText").payload.text, /🔔 13:00, 13:30/,
     "the confirmation should say when the nudges are");
   pass("a timed deadline gets both defaults");
 
@@ -969,11 +1074,11 @@ console.log("\ndefault reminders: a hand-made one at the same minute wins");
   assert.equal(rs[0].auto, 0, "the hand-made reminder was taken over as automatic");
   assert.equal(rs[1].auto, 1);
 
-  // It must not claim credit for a reminder that was already there.
+  // The confirmation lists what is actually scheduled — both of them, once each.
   const text = last("editMessageText").payload.text;
-  assert.match(text, /09:30/);
-  assert.ok(!/09:00/.test(text), `claimed a nudge the user had already set: ${text}`);
-  pass("the existing reminder is left as the user's, and not double-counted");
+  assert.match(text, /🔔 09:00, 09:30/, `unexpected reminder line: ${text}`);
+  assert.equal((text.match(/09:00/g) ?? []).length, 1, "listed the same reminder twice");
+  pass("the existing reminder is left as the user's, and listed once");
 
   // ...and because it stayed hand-made, moving the deadline doesn't sweep it up.
   await tap(`min:d:${id}:${d}:16:00`);
@@ -1076,13 +1181,14 @@ console.log("\n[fix2] the startup migration collapses pre-existing duplicates");
       "-e",
       `import(${JSON.stringify(new URL("../src/db.ts", import.meta.url).href)}).then((m) => {
          const pending = m.listReminders(7).map((r) => r.remind_at);
+         const priorities = m.listTasks(7).map((t) => t.priority);
          const { DatabaseSync } = require("node:sqlite");
          m.closeDb();
          const d = new DatabaseSync(process.env.DB_PATH, { readOnly: true });
          const sent = d.prepare("SELECT COUNT(*) c FROM reminders WHERE sent_at IS NOT NULL").get().c;
          const tasks = d.prepare("SELECT COUNT(*) c FROM tasks").get().c;
          d.close();
-         console.log(JSON.stringify({ pending, sent, tasks }));
+         console.log(JSON.stringify({ pending, sent, tasks, priorities }));
        });`,
     ],
     { env: { ...process.env, DB_PATH: legacy }, encoding: "utf8" },
@@ -1098,7 +1204,10 @@ console.log("\n[fix2] the startup migration collapses pre-existing duplicates");
   );
   assert.equal(got.sent, 2, "sent history must not be touched — it isn't constrained");
   assert.equal(got.tasks, 2, "tasks must survive the migration");
-  pass("6 duplicated pending rows -> 3, history and tasks intact");
+  // The legacy schema has no `priority` column at all; it must arrive defaulted
+  // to medium rather than null, or priorityOf would fall through on every task.
+  assert.deepEqual(got.priorities, [2, 2], `priorities after migration: ${JSON.stringify(got.priorities)}`);
+  pass("6 duplicated pending rows -> 3; history, tasks and a defaulted importance intact");
 }
 
 console.log("\n[fix2] the remove menu can't offer an empty list");
